@@ -1,0 +1,27 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Builds and packaging
+build/
+dist/
+*.egg-info/
+
+# Generated exports
+exports/
+
+# Large mass-spectrometry data
+test_data/
+*.mzML
+*.mzML.gz
+
+# Local application data
+*.log
