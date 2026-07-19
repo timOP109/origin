@@ -44,8 +44,8 @@ avoiding Windows native-DLL load-order conflicts. Missing or incompatible native
 libraries raise a clear `PyOpenMSUnavailableError` in the parent application. The
 worker uses `OnDiscMSExperiment`, so source files must be indexed mzML; spectra are
 sent back one at a time and complete peak arrays are not retained. Closing iteration
-early terminates only the owned worker process. The GUI and packaged application
-continue to use pymzML unless a future GUI control passes an explicit alternative.
+early terminates only the owned worker process. The GUI records whichever backend the
+user explicitly selects; pymzML remains the default.
 
 pyOpenMS carries compiled OpenMS libraries and makes installers substantially larger.
 Windows packaging therefore needs a separate optional build (or explicit collection
@@ -71,7 +71,9 @@ python -m direct_infusion_quant
 ```
 
 The left side of the main window follows the analysis in order: files, target,
-global acquisition-time interval, processing results, calibration, and export.
+fixed acquisition-time duration with optional per-sample start positions,
+processing results, calibration, and export. Stable-period assessment reports
+recommendations for review and never applies them silently.
 Long-running mzML processing runs in a worker thread; progress and scan counts appear
 at the bottom of the window and can be cancelled without silently retaining partial
 results.
@@ -80,6 +82,27 @@ The **Files and Samples** page includes an explicit reader-backend selector. Its
 choice is saved in the project and written to reproducibility exports. Existing
 projects without a recorded choice reopen with the historical `pymzml` default;
 selecting `pyopenms` never silently falls back when the optional backend is missing.
+
+### Stable-period assessment
+
+The common interval duration is defined by **Default start** and **Default end**.
+Each sample can supply an individual start; its end is calculated from the common
+duration. **Assess stable periods** streams every complete source file in a worker
+thread and reports ranked, non-overlapping candidates without changing those starts.
+
+The stability trace is explicit and persisted:
+
+- reference/internal-standard SIC is preferred when a suitable window exists;
+- TIC is available as an analyte-independent alternative;
+- analyte SIC remains available, with a visible response-selection-bias warning.
+
+Candidate ranking reports trace robust CV, relative drift, zero fraction, response,
+score, and separate analyte-SIC diagnostics. Minimum scans, candidate count,
+startup/shutdown exclusions, and optional method limits are user-configurable. Limits
+describe method suitability and do not silently discard candidates. An optional
+score-difference setting visibly flags ambiguous rankings. The user must
+enter or retain each sample start and explicitly confirm all intervals before the
+calibration control is enabled.
 
 ## Project files
 
@@ -104,6 +127,9 @@ processing timestamp. Source SHA-256 values are streamed in a worker thread so f
 are not loaded into memory. PNG exports preserve the spray-response, calibration, and
 residual figures that are available in the project session. This information supports
 reproducibility and review; the application does not claim regulatory compliance.
+Stability-assessment candidates, trace mode, method limits, exclusions, analyte
+diagnostics, effective per-sample intervals, and explicit confirmation state are also
+included.
 
 Use **File → Verify SHA-256 Now…** to explicitly stream and rehash every project
 source, including excluded samples. Results distinguish verified files, byte-level

@@ -24,6 +24,9 @@ from direct_infusion_quant.models import (
     SampleRecord,
     SampleType,
     SourceFileProvenance,
+    StabilityAssessmentRecord,
+    StabilityCandidateRecord,
+    StabilityTraceMode,
     ToleranceUnit,
 )
 from direct_infusion_quant.processing import WarningThresholds, process_file
@@ -63,6 +66,29 @@ def project_and_results(tmp_path: Path):
         sample_type=SampleType.UNKNOWN,
         dilution_factor=2,
         source_provenance=provenance,
+        time_start_seconds=5.0,
+        stability_assessment=StabilityAssessmentRecord(
+            assessed_at_utc=datetime(2026, 7, 18, 11, tzinfo=UTC),
+            trace_mode=StabilityTraceMode.TIC,
+            candidates=[
+                StabilityCandidateRecord(
+                    rank=1,
+                    start_seconds=5,
+                    end_seconds=6,
+                    scan_count=10,
+                    trace_median_response=100,
+                    trace_robust_cv_percent=2,
+                    trace_relative_drift_percent=1,
+                    trace_zero_fraction=0,
+                    trace_signal_fraction=1,
+                    score=3,
+                    analyte_median_response=42,
+                    analyte_robust_cv_percent=4,
+                    analyte_relative_drift_percent=2,
+                    analyte_zero_fraction=0,
+                )
+            ],
+        ),
     )
     settings = ProcessingSettings(
         mzml_backend=MzMLBackend.PYOPENMS,
@@ -114,16 +140,24 @@ def test_csv_and_excel_contain_all_reproducibility_tables(tmp_path: Path) -> Non
     assert "mzml_reader_backend" in settings_text
     assert "pyopenms" in settings_text
     assert "pooled_median" in settings_text
+    assert "stability_trace_mode" in settings_text
+    assessment_text = (tmp_path / "csv" / "stability_assessment.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "trace_robust_cv_percent" in assessment_text
+    assert "analyte_robust_cv_percent" in assessment_text
 
     workbook_path = tmp_path / "analysis.xlsx"
     export_excel_workbook(workbook_path, project, results, None)
-    workbook = openpyxl.load_workbook(workbook_path, read_only=True)
+    workbook = openpyxl.load_workbook(workbook_path)
     assert tuple(workbook.sheetnames) == SHEET_NAMES
     sample_headers = next(
         workbook["Samples"].iter_rows(min_row=1, max_row=1, values_only=True)
     )
     assert "source_file_size_bytes" in sample_headers
     assert "source_file_sha256" in sample_headers
+    assert workbook["Samples"][1][0].font.bold is True
+    assert workbook["Samples"][1][0].fill.fgColor.rgb == "001F4E78"
     software_rows = list(workbook["Software Versions"].iter_rows(values_only=True))
     assert any(row[0] == "DirectInfusionQuant" for row in software_rows)
     assert any("reproducibility and review" in str(row[1]) for row in software_rows)

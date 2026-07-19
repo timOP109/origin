@@ -43,6 +43,14 @@ class MzMLBackend(StrEnum):
     PYOPENMS = "pyopenms"
 
 
+class StabilityTraceMode(StrEnum):
+    """Signal used to place fixed-duration spray-stability intervals."""
+
+    REFERENCE_SIC = "reference_sic"
+    TIC = "tic"
+    ANALYTE_SIC = "analyte_sic"
+
+
 class QuantifierMode(StrEnum):
     """How candidate extraction windows form the quantifier response."""
 
@@ -82,6 +90,35 @@ class SourceFileProvenance(ProjectModel):
     ms_levels: list[int]
     is_centroided: bool | None
     captured_at_utc: datetime
+
+
+class StabilityCandidateRecord(ProjectModel):
+    """Persisted review metrics for one non-applied interval candidate."""
+
+    rank: int = Field(ge=1)
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(gt=0)
+    scan_count: int = Field(ge=3)
+    trace_median_response: float
+    trace_robust_cv_percent: float = Field(ge=0)
+    trace_relative_drift_percent: float = Field(ge=0)
+    trace_zero_fraction: float = Field(ge=0, le=1)
+    trace_signal_fraction: float = Field(ge=0, le=1)
+    score: float
+    limit_failures: list[str] = Field(default_factory=list)
+    analyte_median_response: float
+    analyte_robust_cv_percent: float = Field(ge=0)
+    analyte_relative_drift_percent: float = Field(ge=0)
+    analyte_zero_fraction: float = Field(ge=0, le=1)
+
+
+class StabilityAssessmentRecord(ProjectModel):
+    """Persisted, non-destructive stability assessment for one sample."""
+
+    assessed_at_utc: datetime
+    trace_mode: StabilityTraceMode
+    ambiguous: bool = False
+    candidates: list[StabilityCandidateRecord]
 
 
 class ExtractionWindow(ProjectModel):
@@ -144,7 +181,9 @@ class SampleRecord(ProjectModel):
     concentration_unit: str | None = None
     dilution_factor: float = Field(default=1.0, gt=0)
     replicate_group: str | None = None
+    time_start_seconds: float | None = Field(default=None, ge=0)
     source_provenance: SourceFileProvenance | None = None
+    stability_assessment: StabilityAssessmentRecord | None = None
 
     @model_validator(mode="after")
     def validate_standard_concentration(self) -> SampleRecord:
@@ -157,7 +196,7 @@ class SampleRecord(ProjectModel):
 
 
 class ProcessingSettings(ProjectModel):
-    """Common extraction settings applied to every file in an analysis."""
+    """Shared extraction settings and default acquisition-time interval."""
 
     ms_level: int = Field(default=1, ge=1)
     mzml_backend: MzMLBackend = MzMLBackend.PYMZML
@@ -165,6 +204,18 @@ class ProcessingSettings(ProjectModel):
     time_end_seconds: float | None = Field(default=None, gt=0)
     summary_method: SummaryMethod = SummaryMethod.MEDIAN
     trim_fraction: float = Field(default=0.1, ge=0, lt=0.5)
+    stability_trace_mode: StabilityTraceMode = StabilityTraceMode.ANALYTE_SIC
+    stability_reference_window_id: UUID | None = None
+    stability_minimum_scans: int = Field(default=10, ge=3)
+    stability_max_robust_cv_percent: float | None = Field(default=None, gt=0)
+    stability_max_relative_drift_percent: float | None = Field(default=None, gt=0)
+    stability_max_zero_fraction: float | None = Field(default=None, ge=0, le=1)
+    stability_minimum_response: float | None = Field(default=None, gt=0)
+    stability_exclude_before_seconds: float | None = Field(default=None, ge=0)
+    stability_exclude_after_seconds: float | None = Field(default=None, gt=0)
+    stability_candidate_count: int = Field(default=3, ge=1, le=10)
+    stability_ambiguity_score_delta_percent: float | None = Field(default=None, gt=0)
+    stability_intervals_confirmed: bool = False
 
     @model_validator(mode="after")
     def validate_time_interval(self) -> ProcessingSettings:
@@ -173,6 +224,18 @@ class ProcessingSettings(ProjectModel):
             and self.time_end_seconds <= self.time_start_seconds
         ):
             raise ValueError("time interval end must be greater than its start")
+        if (
+            self.stability_exclude_before_seconds is not None
+            and self.stability_exclude_after_seconds is not None
+            and self.stability_exclude_after_seconds
+            <= self.stability_exclude_before_seconds
+        ):
+            raise ValueError("stability exclusion end must be after its start")
+        if (
+            self.stability_trace_mode is StabilityTraceMode.REFERENCE_SIC
+            and self.stability_reference_window_id is None
+        ):
+            raise ValueError("reference SIC requires an explicit reference window")
         return self
 
 
@@ -211,4 +274,18 @@ class AnalysisProject(ProjectModel):
             and self.active_analyte_id not in analyte_ids
         ):
             raise ValueError("active analyte ID does not reference a project analyte")
+        if self.processing.stability_trace_mode is StabilityTraceMode.REFERENCE_SIC:
+            active = next(
+                (
+                    analyte
+                    for analyte in self.analytes
+                    if analyte.id == self.active_analyte_id
+                ),
+                None,
+            )
+            window_ids = {window.id for window in active.windows} if active else set()
+            if self.processing.stability_reference_window_id not in window_ids:
+                raise ValueError(
+                    "stability reference window is not present in the active analyte"
+                )
         return self

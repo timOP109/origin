@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from threading import Event
 
+import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
 from direct_infusion_quant.io import MzMLBackend, MzMLReader, create_mzml_reader
@@ -16,12 +17,19 @@ from direct_infusion_quant.models import (
     AnalysisProject,
     QuantifierMode,
     SourceFileProvenance,
+    StabilityTraceMode,
 )
 from direct_infusion_quant.processing import (
     FileProcessingResult,
     ProcessingCancelled,
+    StabilityLimits,
+    StableIntervalRecommendation,
     WarningThresholds,
+    interval_diagnostics,
     process_file,
+    recommend_stable_intervals,
+    settings_for_sample,
+    window_bounds,
 )
 
 
@@ -33,6 +41,27 @@ class ProcessingBundle:
     failures: dict[str, str]
     provenance: dict[str, SourceFileProvenance]
     processed_at_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StabilityRecommendationBundle:
+    """Per-sample recommendations and visible assessment failures."""
+
+    assessments: dict[str, SampleStabilityAssessment]
+    failures: dict[str, str]
+    assessed_at_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SampleStabilityAssessment:
+    """Ranked stability candidates with separate analyte-SIC diagnostics."""
+
+    candidates: tuple[StableIntervalRecommendation, ...]
+    analyte_diagnostics: tuple[StableIntervalRecommendation, ...]
+    times_seconds: tuple[float, ...]
+    trace_responses: tuple[float, ...]
+    analyte_responses: tuple[float, ...]
+    ambiguous: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,10 +281,11 @@ class ProcessingWorker(QObject):
                         if analyte.quantifier_mode is QuantifierMode.SUM
                         else ()
                     )
+                    settings = settings_for_sample(self.project.processing, sample)
                     results[str(sample.id)] = process_file(
                         spectra(),
                         analyte.windows,
-                        self.project.processing,
+                        settings,
                         self.thresholds,
                         quantifier_window_id=quantifier,
                         derived_window_ids=derived,
@@ -275,6 +305,166 @@ class ProcessingWorker(QObject):
                     provenance=provenance,
                     processed_at_utc=datetime.now(UTC),
                 )
+            )
+        except ProcessingCancelled:
+            self.cancelled.emit()
+        except Exception as error:
+            self.failed.emit(str(error), traceback.format_exc())
+        finally:
+            self.finished.emit()
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+
+class StabilityRecommendationWorker(QObject):
+    """Stream complete files and recommend fixed-duration stable periods."""
+
+    progress = Signal(int, int, int, str)
+    succeeded = Signal(object)
+    failed = Signal(str, str)
+    cancelled = Signal()
+    finished = Signal()
+
+    def __init__(self, project: AnalysisProject) -> None:
+        super().__init__()
+        self.project = project.model_copy(deep=True)
+        self._cancelled = Event()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            analyte = next(
+                item
+                for item in self.project.analytes
+                if item.id == self.project.active_analyte_id
+            )
+            duration = (
+                self.project.processing.time_end_seconds
+                - self.project.processing.time_start_seconds
+            )
+            quantifier_ids = analyte.quantifier_window_ids
+            quantifier_windows = [
+                window
+                for window in analyte.windows
+                if window.enabled and window.id in quantifier_ids
+            ]
+            analyte_bounds = [window_bounds(window) for window in quantifier_windows]
+            trace_mode = self.project.processing.stability_trace_mode
+            trace_bounds: list[tuple[float, float]] = []
+            if trace_mode is StabilityTraceMode.ANALYTE_SIC:
+                trace_bounds = analyte_bounds
+            elif trace_mode is StabilityTraceMode.REFERENCE_SIC:
+                reference_id = self.project.processing.stability_reference_window_id
+                reference = next(
+                    window for window in analyte.windows if window.id == reference_id
+                )
+                trace_bounds = [window_bounds(reference)]
+            included = [sample for sample in self.project.samples if sample.included]
+            reader = create_mzml_reader(self.project.processing.mzml_backend)
+            assessments: dict[str, SampleStabilityAssessment] = {}
+            failures: dict[str, str] = {}
+            for file_index, sample in enumerate(included, start=1):
+                times: list[float] = []
+                trace_responses: list[float] = []
+                analyte_responses: list[float] = []
+                try:
+                    for count, scan in enumerate(
+                        reader.iter_spectra(sample.path), start=1
+                    ):
+                        if self._cancelled.is_set():
+                            raise ProcessingCancelled("stability assessment cancelled")
+                        if count == 1 or count % 25 == 0:
+                            self.progress.emit(
+                                file_index, len(included), count, sample.sample_name
+                            )
+                        if scan.ms_level != self.project.processing.ms_level:
+                            continue
+                        analyte_response = sum(
+                            float(
+                                np.sum(
+                                    scan.intensity[
+                                        (scan.mz >= lower) & (scan.mz <= upper)
+                                    ],
+                                    dtype=np.float64,
+                                )
+                            )
+                            for lower, upper in analyte_bounds
+                        )
+                        trace_response = (
+                            float(np.sum(scan.intensity, dtype=np.float64))
+                            if trace_mode is StabilityTraceMode.TIC
+                            else sum(
+                                float(
+                                    np.sum(
+                                        scan.intensity[
+                                            (scan.mz >= lower) & (scan.mz <= upper)
+                                        ],
+                                        dtype=np.float64,
+                                    )
+                                )
+                                for lower, upper in trace_bounds
+                            )
+                        )
+                        times.append(scan.elapsed_time_seconds)
+                        trace_responses.append(trace_response)
+                        analyte_responses.append(analyte_response)
+                    processing = self.project.processing
+                    candidates = recommend_stable_intervals(
+                        times,
+                        trace_responses,
+                        duration,
+                        minimum_scans=processing.stability_minimum_scans,
+                        candidate_count=processing.stability_candidate_count,
+                        exclude_before_seconds=(
+                            processing.stability_exclude_before_seconds
+                        ),
+                        exclude_after_seconds=processing.stability_exclude_after_seconds,
+                        limits=StabilityLimits(
+                            max_robust_cv_percent=(
+                                processing.stability_max_robust_cv_percent
+                            ),
+                            max_relative_drift_percent=(
+                                processing.stability_max_relative_drift_percent
+                            ),
+                            max_zero_fraction=processing.stability_max_zero_fraction,
+                            minimum_response=processing.stability_minimum_response,
+                        ),
+                    )
+                    diagnostics = tuple(
+                        interval_diagnostics(
+                            times,
+                            analyte_responses,
+                            candidate.start_seconds,
+                            candidate.end_seconds,
+                        )
+                        for candidate in candidates
+                    )
+                    ambiguity_limit = processing.stability_ambiguity_score_delta_percent
+                    ambiguous = False
+                    if ambiguity_limit is not None and len(candidates) > 1:
+                        best_scale = max(abs(candidates[0].score), 1e-12)
+                        score_delta = (
+                            100.0
+                            * abs(candidates[1].score - candidates[0].score)
+                            / best_scale
+                        )
+                        ambiguous = score_delta <= ambiguity_limit
+                    assessments[str(sample.id)] = SampleStabilityAssessment(
+                        candidates,
+                        diagnostics,
+                        tuple(times),
+                        tuple(trace_responses),
+                        tuple(analyte_responses),
+                        ambiguous,
+                    )
+                except ProcessingCancelled:
+                    raise
+                except Exception as error:
+                    failures[str(sample.id)] = str(error)
+            self.succeeded.emit(
+                StabilityRecommendationBundle(assessments, failures, datetime.now(UTC))
             )
         except ProcessingCancelled:
             self.cancelled.emit()

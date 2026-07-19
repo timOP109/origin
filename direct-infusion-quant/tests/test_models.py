@@ -13,6 +13,7 @@ from direct_infusion_quant.models import (
     QuantifierMode,
     SampleRecord,
     SampleType,
+    StabilityTraceMode,
     ToleranceUnit,
 )
 
@@ -48,6 +49,34 @@ def test_window_requires_positive_mz_and_tolerance() -> None:
 def test_invalid_time_interval_is_rejected() -> None:
     with pytest.raises(ValidationError):
         ProcessingSettings(time_start_seconds=10, time_end_seconds=10)
+
+
+def test_sample_individual_start_must_be_non_negative() -> None:
+    with pytest.raises(ValidationError):
+        SampleRecord(
+            path=Path("sample.mzML"),
+            sample_name="sample",
+            sample_type=SampleType.UNKNOWN,
+            time_start_seconds=-1,
+        )
+
+
+def test_reference_stability_trace_requires_active_window() -> None:
+    with pytest.raises(ValidationError, match="reference SIC"):
+        ProcessingSettings(stability_trace_mode=StabilityTraceMode.REFERENCE_SIC)
+
+    window = make_window()
+    analyte = AnalyteTarget(name="peptide", windows=[window])
+    with pytest.raises(ValidationError, match="not present"):
+        AnalysisProject(
+            name="project",
+            analytes=[analyte],
+            active_analyte_id=analyte.id,
+            processing=ProcessingSettings(
+                stability_trace_mode=StabilityTraceMode.REFERENCE_SIC,
+                stability_reference_window_id=make_window().id,
+            ),
+        )
 
 
 def test_project_active_analyte_must_exist() -> None:

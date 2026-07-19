@@ -16,6 +16,7 @@ SHEET_NAMES = (
     "Samples",
     "Targets and Windows",
     "Processing Settings",
+    "Stability Assessment",
     "Scan Summary",
     "File Responses",
     "Calibration Standards",
@@ -29,6 +30,7 @@ CSV_NAMES = {
     "Samples": "samples.csv",
     "Targets and Windows": "targets_and_extraction_windows.csv",
     "Processing Settings": "processing_settings.csv",
+    "Stability Assessment": "stability_assessment.csv",
     "Scan Summary": "scan_summary.csv",
     "File Responses": "file_responses.csv",
     "Calibration Standards": "calibration_standards.csv",
@@ -78,8 +80,41 @@ def result_tables(
                 "concentration_unit": sample.concentration_unit,
                 "dilution_factor": sample.dilution_factor,
                 "replicate_group": sample.replicate_group,
+                "individual_time_start_seconds": sample.time_start_seconds,
+                "effective_time_start_seconds": (
+                    sample.time_start_seconds
+                    if sample.time_start_seconds is not None
+                    else project.processing.time_start_seconds
+                ),
+                "effective_time_end_seconds": (
+                    (
+                        sample.time_start_seconds
+                        if sample.time_start_seconds is not None
+                        else project.processing.time_start_seconds
+                    )
+                    + (
+                        project.processing.time_end_seconds
+                        - project.processing.time_start_seconds
+                    )
+                    if project.processing.time_end_seconds is not None
+                    else None
+                ),
             }
         )
+        if sample.stability_assessment is not None:
+            for candidate in sample.stability_assessment.candidates:
+                tables["Stability Assessment"].append(
+                    {
+                        "sample_id": str(sample.id),
+                        "sample_name": sample.sample_name,
+                        "assessed_at_utc": (
+                            sample.stability_assessment.assessed_at_utc.isoformat()
+                        ),
+                        "trace_mode": sample.stability_assessment.trace_mode.value,
+                        "ambiguous": sample.stability_assessment.ambiguous,
+                        **candidate.model_dump(mode="json"),
+                    }
+                )
         if provenance is not None and provenance.is_centroided is not True:
             tables["Warnings"].append(
                 {
@@ -143,6 +178,8 @@ def result_tables(
                     "sample_name": sample.sample_name,
                     "response_source": str(window_id),
                     "selected_file_response": result.quantification_response,
+                    "time_start_seconds": result.time_start_seconds,
+                    "time_end_seconds": result.time_end_seconds,
                     **_summary_dict(summary),
                 }
             )
@@ -153,6 +190,8 @@ def result_tables(
                     "sample_name": sample.sample_name,
                     "response_source": "explicit_sum",
                     "selected_file_response": result.quantification_response,
+                    "time_start_seconds": result.time_start_seconds,
+                    "time_end_seconds": result.time_end_seconds,
                     **_summary_dict(result.derived_summary),
                 }
             )
@@ -179,15 +218,63 @@ def _processing_settings(project: AnalysisProject) -> list[dict[str, Any]]:
         {"setting": "mzml_reader_backend", "value": processing.mzml_backend.value},
         {"setting": "selected_ms_level", "value": processing.ms_level},
         {
-            "setting": "common_time_start_seconds",
+            "setting": "default_time_start_seconds",
             "value": processing.time_start_seconds,
         },
         {
-            "setting": "common_time_end_seconds",
+            "setting": "default_time_end_seconds",
             "value": processing.time_end_seconds,
         },
         {"setting": "response_statistic", "value": processing.summary_method.value},
         {"setting": "trim_fraction_per_tail", "value": processing.trim_fraction},
+        {
+            "setting": "stability_trace_mode",
+            "value": processing.stability_trace_mode.value,
+        },
+        {
+            "setting": "stability_reference_window_id",
+            "value": processing.stability_reference_window_id,
+        },
+        {
+            "setting": "stability_minimum_scans",
+            "value": processing.stability_minimum_scans,
+        },
+        {
+            "setting": "stability_candidate_count",
+            "value": processing.stability_candidate_count,
+        },
+        {
+            "setting": "stability_ambiguity_score_delta_percent",
+            "value": processing.stability_ambiguity_score_delta_percent,
+        },
+        {
+            "setting": "stability_max_robust_cv_percent",
+            "value": processing.stability_max_robust_cv_percent,
+        },
+        {
+            "setting": "stability_max_relative_drift_percent",
+            "value": processing.stability_max_relative_drift_percent,
+        },
+        {
+            "setting": "stability_max_zero_fraction",
+            "value": processing.stability_max_zero_fraction,
+        },
+        {
+            "setting": "stability_minimum_response",
+            "value": processing.stability_minimum_response,
+        },
+        {
+            "setting": "stability_exclude_before_seconds",
+            "value": processing.stability_exclude_before_seconds,
+        },
+        {
+            "setting": "stability_exclude_after_seconds",
+            "value": processing.stability_exclude_after_seconds,
+        },
+        {
+            "setting": "stability_intervals_confirmed",
+            "value": processing.stability_intervals_confirmed,
+        },
         {"setting": "blank_method", "value": calibration.blank_correction.value},
         {"setting": "regression_model", "value": "linear"},
         {"setting": "weighting", "value": calibration.weighting.value},

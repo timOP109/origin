@@ -11,7 +11,12 @@ Before changing code:
 Scientific invariants:
 - This is direct infusion, not chromatography.
 - Acquisition time is elapsed spray time, not retention time.
-- Apply one common acquisition-time interval to every file in a batch.
+- Apply one common acquisition-time duration to every file in a batch; allow
+  each file's explicitly selected start position to differ.
+- Prefer an explicitly selected internal-standard/reference SIC or TIC for
+  interval assessment; label analyte-SIC response-selection bias.
+- Never apply a recommended interval automatically. Require explicit interval
+  confirmation before calibration.
 - Apply one common m/z window to every file in a batch.
 - Do not silently alter concentration units.
 - Do not silently change the response statistic, blank handling, regression

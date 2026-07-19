@@ -12,6 +12,7 @@ from direct_infusion_quant.io.base import SpectrumRecord
 from direct_infusion_quant.models import (
     ExtractionWindow,
     ProcessingSettings,
+    SampleRecord,
     SummaryMethod,
     ToleranceUnit,
 )
@@ -75,9 +76,29 @@ class FileProcessingResult:
     quantification_response: float | None
     warnings: tuple[ProcessingWarning, ...]
     observed_mz_range: tuple[float, float] | None
+    time_start_seconds: float
+    time_end_seconds: float
 
 
 CancelCheck = Callable[[], bool]
+
+
+def settings_for_sample(
+    settings: ProcessingSettings, sample: SampleRecord
+) -> ProcessingSettings:
+    """Apply a sample start override while preserving the shared duration."""
+
+    if sample.time_start_seconds is None:
+        return settings
+    if settings.time_end_seconds is None:
+        raise ProcessingError("a finite default interval is required")
+    duration = settings.time_end_seconds - settings.time_start_seconds
+    return settings.model_copy(
+        update={
+            "time_start_seconds": sample.time_start_seconds,
+            "time_end_seconds": sample.time_start_seconds + duration,
+        }
+    )
 
 
 def window_bounds(window: ExtractionWindow) -> tuple[float, float]:
@@ -101,10 +122,10 @@ def process_file(
     derived_window_ids: Sequence[UUID] = (),
     is_cancelled: CancelCheck | None = None,
 ) -> FileProcessingResult:
-    """Extract and summarize one file using common direct-infusion settings."""
+    """Extract and summarize one file using explicit direct-infusion settings."""
 
     if settings.time_end_seconds is None:
-        raise ProcessingError("a finite global acquisition-time interval is required")
+        raise ProcessingError("a finite acquisition-time interval is required")
     if settings.time_start_seconds >= settings.time_end_seconds:
         raise ProcessingError("acquisition-time interval start must be before end")
 
@@ -183,7 +204,7 @@ def process_file(
         )
         observed = f"{selected_level_time_min:g}–{selected_level_time_max:g} seconds"
         raise ProcessingError(
-            f"global interval {interval} does not overlap this file's "
+            f"selected interval {interval} does not overlap this file's "
             f"MS{settings.ms_level} acquisition range {observed}"
         )
 
@@ -233,6 +254,8 @@ def process_file(
         observed_mz_range=(observed_mz_min, observed_mz_max)
         if observed_mz_min is not None and observed_mz_max is not None
         else None,
+        time_start_seconds=settings.time_start_seconds,
+        time_end_seconds=settings.time_end_seconds,
     )
 
 
@@ -246,7 +269,7 @@ def process_files(
     derived_window_ids: Sequence[UUID] = (),
     is_cancelled: CancelCheck | None = None,
 ) -> dict[str, FileProcessingResult]:
-    """Process every included file with exactly the same settings."""
+    """Process files with the supplied explicit settings."""
 
     results: dict[str, FileProcessingResult] = {}
     for file_id, spectra in spectra_by_file.items():

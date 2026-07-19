@@ -41,6 +41,7 @@ from direct_infusion_quant.models import (
     QuantifierMode,
     SampleRecord,
     SampleType,
+    StabilityTraceMode,
     SummaryMethod,
     ToleranceUnit,
     WeightingMode,
@@ -79,6 +80,7 @@ class FilesPage(QWidget):
         "Unit",
         "Dilution factor",
         "Replicate group",
+        "Individual start (s)",
         "Metadata / warnings",
     ]
 
@@ -146,7 +148,8 @@ class FilesPage(QWidget):
             self.table.setItem(row, 5, _item())
             self.table.setItem(row, 6, _item("1"))
             self.table.setItem(row, 7, _item())
-            self.table.setItem(row, 8, _item("Not inspected", editable=False))
+            self.table.setItem(row, 8, _item())
+            self.table.setItem(row, 9, _item("Not inspected", editable=False))
             existing.add(resolved)
 
     def remove_selected(self) -> None:
@@ -162,7 +165,7 @@ class FilesPage(QWidget):
                 item = _item(text, editable=False)
                 if warning:
                     item.setForeground(Qt.GlobalColor.darkYellow)
-                self.table.setItem(row, 8, item)
+                self.table.setItem(row, 9, item)
                 return
 
     def set_status(self, sample_id: UUID, text: str, warning: bool = False) -> None:
@@ -195,6 +198,11 @@ class FilesPage(QWidget):
                     concentration_unit=self.table.item(row, 5).text().strip() or None,
                     dilution_factor=float(self.table.item(row, 6).text()),
                     replicate_group=self.table.item(row, 7).text().strip() or None,
+                    time_start_seconds=(
+                        float(self.table.item(row, 8).text())
+                        if self.table.item(row, 8).text().strip()
+                        else None
+                    ),
                 )
             )
         return samples
@@ -216,6 +224,11 @@ class FilesPage(QWidget):
             self.table.item(row, 5).setText(sample.concentration_unit or "")
             self.table.item(row, 6).setText(str(sample.dilution_factor))
             self.table.item(row, 7).setText(sample.replicate_group or "")
+            self.table.item(row, 8).setText(
+                ""
+                if sample.time_start_seconds is None
+                else str(sample.time_start_seconds)
+            )
             provenance = sample.source_provenance
             if provenance is not None:
                 mode = (
@@ -230,7 +243,7 @@ class FilesPage(QWidget):
                     f"Saved metadata: {provenance.spectrum_count} spectra; "
                     f"MS levels {provenance.ms_levels}; {mode}"
                 )
-                metadata_item = self.table.item(row, 8)
+                metadata_item = self.table.item(row, 9)
                 metadata_item.setText(saved_text)
                 metadata_item.setToolTip(
                     f"Saved metadata captured {captured}; not freshly inspected "
@@ -242,18 +255,18 @@ class FilesPage(QWidget):
                 missing_text = "Source file is missing"
                 if provenance is not None:
                     missing_text += f"; {saved_text}"
-                self.table.item(row, 8).setText(missing_text)
-                self.table.item(row, 8).setForeground(Qt.GlobalColor.red)
+                self.table.item(row, 9).setText(missing_text)
+                self.table.item(row, 9).setForeground(Qt.GlobalColor.red)
             elif provenance is not None:
                 stat = sample.path.stat()
                 if (
                     stat.st_size != provenance.file_size_bytes
                     or stat.st_mtime_ns != provenance.modified_time_ns
                 ):
-                    self.table.item(row, 8).setText(
+                    self.table.item(row, 9).setText(
                         "Source file size or modification time changed; " + saved_text
                     )
-                    self.table.item(row, 8).setForeground(Qt.GlobalColor.darkYellow)
+                    self.table.item(row, 9).setForeground(Qt.GlobalColor.darkYellow)
 
     def selected_backend(self) -> MzMLBackend:
         """Return the backend explicitly displayed in the selector."""
@@ -372,6 +385,8 @@ class TargetsPage(QWidget):
                 charge=int(charge) if charge else None,
                 enabled=self.table.item(row, 0).checkState() == Qt.CheckState.Checked,
             )
+            if not window_id:
+                label_item.setData(Qt.ItemDataRole.UserRole, str(window.id))
             windows.append(window)
             if self.table.item(row, 1).checkState() == Qt.CheckState.Checked:
                 selected.append(window.id)
@@ -408,7 +423,7 @@ class TargetsPage(QWidget):
 
 
 class IntervalCanvas(PlotCanvas):
-    """Spray-response plot with draggable global interval lines."""
+    """Spray-response plot with draggable default interval lines."""
 
     interval_changed = Signal(float, float)
 
@@ -457,13 +472,15 @@ class IntervalCanvas(PlotCanvas):
 
 
 class TimePage(QWidget):
-    """Global acquisition-time interval and spray-response preview."""
+    """Fixed-duration acquisition interval and spray-response preview."""
 
     process_requested = Signal()
     cancel_requested = Signal()
+    recommendation_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self._loading = False
         self.ms_level = QSpinBox()
         self.ms_level.setRange(1, 20)
         self.start = QDoubleSpinBox()
@@ -491,15 +508,105 @@ class TimePage(QWidget):
         self.zero_limit.setValue(50)
         self.zero_limit.setEnabled(False)
         self.zero_enabled.toggled.connect(self.zero_limit.setEnabled)
+        self.trace_mode = QComboBox()
+        self.trace_mode.addItem(
+            "Reference/internal-standard SIC (preferred)",
+            StabilityTraceMode.REFERENCE_SIC,
+        )
+        self.trace_mode.addItem("Total ion current (TIC)", StabilityTraceMode.TIC)
+        self.trace_mode.addItem("Analyte SIC", StabilityTraceMode.ANALYTE_SIC)
+        self.trace_mode.setToolTip(
+            "Analyte SIC can bias interval placement toward higher analyte response. "
+            "Prefer an independent reference SIC or TIC when scientifically suitable."
+        )
+        self.reference_window = QComboBox()
+        self.reference_window.setToolTip(
+            "Explicit extraction window used only as the spray-stability reference."
+        )
+        self.trace_mode.currentIndexChanged.connect(self._update_reference_enabled)
+        self.minimum_scans = QSpinBox()
+        self.minimum_scans.setRange(3, 1_000_000)
+        self.minimum_scans.setValue(10)
+        self.candidate_count = QSpinBox()
+        self.candidate_count.setRange(1, 10)
+        self.candidate_count.setValue(3)
+        self.ambiguity_enabled = QCheckBox("Flag close candidate scores")
+        self.ambiguity_limit = QDoubleSpinBox()
+        self.ambiguity_limit.setRange(0.001, 1_000_000)
+        self.ambiguity_limit.setSuffix(" % difference")
+        self.ambiguity_limit.setEnabled(False)
+        self.ambiguity_enabled.toggled.connect(self.ambiguity_limit.setEnabled)
+        self.stability_cv_enabled = QCheckBox("Limit robust CV")
+        self.stability_cv_limit = QDoubleSpinBox()
+        self.stability_cv_limit.setRange(0.001, 1_000_000)
+        self.stability_cv_limit.setSuffix(" %")
+        self.stability_cv_limit.setEnabled(False)
+        self.stability_cv_enabled.toggled.connect(self.stability_cv_limit.setEnabled)
+        self.drift_enabled = QCheckBox("Limit relative drift")
+        self.drift_limit = QDoubleSpinBox()
+        self.drift_limit.setRange(0.001, 1_000_000)
+        self.drift_limit.setSuffix(" %")
+        self.drift_limit.setEnabled(False)
+        self.drift_enabled.toggled.connect(self.drift_limit.setEnabled)
+        self.stability_zero_enabled = QCheckBox("Limit zero-response fraction")
+        self.stability_zero_limit = QDoubleSpinBox()
+        self.stability_zero_limit.setRange(0, 100)
+        self.stability_zero_limit.setSuffix(" %")
+        self.stability_zero_limit.setEnabled(False)
+        self.stability_zero_enabled.toggled.connect(
+            self.stability_zero_limit.setEnabled
+        )
+        self.minimum_response_enabled = QCheckBox("Require median trace response")
+        self.minimum_response = QDoubleSpinBox()
+        self.minimum_response.setRange(0.000001, 1e18)
+        self.minimum_response.setDecimals(6)
+        self.minimum_response.setEnabled(False)
+        self.minimum_response_enabled.toggled.connect(self.minimum_response.setEnabled)
+        self.exclude_before_enabled = QCheckBox("Exclude startup before")
+        self.exclude_before = QDoubleSpinBox()
+        self.exclude_before.setRange(0, 1_000_000)
+        self.exclude_before.setSuffix(" s")
+        self.exclude_before.setEnabled(False)
+        self.exclude_before_enabled.toggled.connect(self.exclude_before.setEnabled)
+        self.exclude_after_enabled = QCheckBox("Exclude shutdown after")
+        self.exclude_after = QDoubleSpinBox()
+        self.exclude_after.setRange(0.0001, 1_000_000)
+        self.exclude_after.setSuffix(" s")
+        self.exclude_after.setEnabled(False)
+        self.exclude_after_enabled.toggled.connect(self.exclude_after.setEnabled)
+        self.intervals_confirmed = QCheckBox(
+            "I reviewed and approved every included sample's fixed-duration interval"
+        )
+        self.intervals_confirmed.setToolTip(
+            "Required before calibration. Assessment recommendations are never "
+            "accepted automatically."
+        )
         form = QFormLayout()
         form.addRow("MS level", self.ms_level)
-        form.addRow("Global start", self.start)
-        form.addRow("Global end", self.end)
+        form.addRow("Default start", self.start)
+        form.addRow("Default end", self.end)
         form.addRow("Trim fraction per tail", self.trim_fraction)
+        form.addRow("Stability trace", self.trace_mode)
+        form.addRow("Reference window", self.reference_window)
+        form.addRow("Candidate periods", self.candidate_count)
+        form.addRow(self.ambiguity_enabled, self.ambiguity_limit)
+        form.addRow("Minimum scans per candidate", self.minimum_scans)
+        form.addRow(self.stability_cv_enabled, self.stability_cv_limit)
+        form.addRow(self.drift_enabled, self.drift_limit)
+        form.addRow(self.stability_zero_enabled, self.stability_zero_limit)
+        form.addRow(self.minimum_response_enabled, self.minimum_response)
+        form.addRow(self.exclude_before_enabled, self.exclude_before)
+        form.addRow(self.exclude_after_enabled, self.exclude_after)
         form.addRow(self.rsd_enabled, self.rsd_limit)
         form.addRow(self.zero_enabled, self.zero_limit)
         process = QPushButton("Process files")
         process.clicked.connect(self.process_requested)
+        recommend = QPushButton("Assess stable periods")
+        recommend.clicked.connect(self.recommendation_requested)
+        recommend.setToolTip(
+            "Stream complete files and report ranked, non-overlapping fixed-duration "
+            "periods. Recommendations are not applied."
+        )
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.cancel_requested)
         cancel.setToolTip(
@@ -507,6 +614,7 @@ class TimePage(QWidget):
         )
         buttons = QHBoxLayout()
         buttons.addWidget(process)
+        buttons.addWidget(recommend)
         buttons.addWidget(cancel)
         buttons.addStretch()
         self.canvas = IntervalCanvas()
@@ -520,7 +628,39 @@ class TimePage(QWidget):
         layout.addWidget(QLabel("Time Window and Stability"))
         layout.addLayout(form)
         layout.addLayout(buttons)
+        layout.addWidget(self.intervals_confirmed)
         layout.addWidget(self.canvas)
+        watched = [
+            self.ms_level,
+            self.start,
+            self.end,
+            self.trace_mode,
+            self.reference_window,
+            self.candidate_count,
+            self.minimum_scans,
+            self.ambiguity_enabled,
+            self.ambiguity_limit,
+            self.stability_cv_enabled,
+            self.stability_cv_limit,
+            self.drift_enabled,
+            self.drift_limit,
+            self.stability_zero_enabled,
+            self.stability_zero_limit,
+            self.minimum_response_enabled,
+            self.minimum_response,
+            self.exclude_before_enabled,
+            self.exclude_before,
+            self.exclude_after_enabled,
+            self.exclude_after,
+        ]
+        for control in watched:
+            if isinstance(control, QComboBox):
+                control.currentIndexChanged.connect(self._mark_unconfirmed)
+            elif isinstance(control, QCheckBox):
+                control.toggled.connect(self._mark_unconfirmed)
+            else:
+                control.valueChanged.connect(self._mark_unconfirmed)
+        self._update_reference_enabled()
 
     def settings(
         self, method: SummaryMethod, backend: MzMLBackend
@@ -532,13 +672,128 @@ class TimePage(QWidget):
             time_end_seconds=self.end.value(),
             summary_method=method,
             trim_fraction=self.trim_fraction.value(),
+            stability_trace_mode=self.trace_mode.currentData(),
+            stability_reference_window_id=self.reference_window.currentData(),
+            stability_minimum_scans=self.minimum_scans.value(),
+            stability_max_robust_cv_percent=(
+                self.stability_cv_limit.value()
+                if self.stability_cv_enabled.isChecked()
+                else None
+            ),
+            stability_max_relative_drift_percent=(
+                self.drift_limit.value() if self.drift_enabled.isChecked() else None
+            ),
+            stability_max_zero_fraction=(
+                self.stability_zero_limit.value() / 100.0
+                if self.stability_zero_enabled.isChecked()
+                else None
+            ),
+            stability_minimum_response=(
+                self.minimum_response.value()
+                if self.minimum_response_enabled.isChecked()
+                else None
+            ),
+            stability_exclude_before_seconds=(
+                self.exclude_before.value()
+                if self.exclude_before_enabled.isChecked()
+                else None
+            ),
+            stability_exclude_after_seconds=(
+                self.exclude_after.value()
+                if self.exclude_after_enabled.isChecked()
+                else None
+            ),
+            stability_candidate_count=self.candidate_count.value(),
+            stability_ambiguity_score_delta_percent=(
+                self.ambiguity_limit.value()
+                if self.ambiguity_enabled.isChecked()
+                else None
+            ),
+            stability_intervals_confirmed=self.intervals_confirmed.isChecked(),
         )
 
     def load_settings(self, settings: ProcessingSettings) -> None:
+        self._loading = True
         self.ms_level.setValue(settings.ms_level)
         self.start.setValue(settings.time_start_seconds)
         self.end.setValue(settings.time_end_seconds or 0)
         self.trim_fraction.setValue(settings.trim_fraction)
+        self.trace_mode.setCurrentIndex(
+            self.trace_mode.findData(settings.stability_trace_mode)
+        )
+        self.reference_window.setCurrentIndex(
+            self.reference_window.findData(settings.stability_reference_window_id)
+        )
+        self.minimum_scans.setValue(settings.stability_minimum_scans)
+        self.candidate_count.setValue(settings.stability_candidate_count)
+        self._load_optional(
+            self.ambiguity_enabled,
+            self.ambiguity_limit,
+            settings.stability_ambiguity_score_delta_percent,
+        )
+        self._load_optional(
+            self.stability_cv_enabled,
+            self.stability_cv_limit,
+            settings.stability_max_robust_cv_percent,
+        )
+        self._load_optional(
+            self.drift_enabled,
+            self.drift_limit,
+            settings.stability_max_relative_drift_percent,
+        )
+        self._load_optional(
+            self.stability_zero_enabled,
+            self.stability_zero_limit,
+            None
+            if settings.stability_max_zero_fraction is None
+            else settings.stability_max_zero_fraction * 100.0,
+        )
+        self._load_optional(
+            self.minimum_response_enabled,
+            self.minimum_response,
+            settings.stability_minimum_response,
+        )
+        self._load_optional(
+            self.exclude_before_enabled,
+            self.exclude_before,
+            settings.stability_exclude_before_seconds,
+        )
+        self._load_optional(
+            self.exclude_after_enabled,
+            self.exclude_after,
+            settings.stability_exclude_after_seconds,
+        )
+        self.intervals_confirmed.setChecked(settings.stability_intervals_confirmed)
+        self._loading = False
+        self._update_reference_enabled()
+
+    def load_reference_windows(self, analyte: AnalyteTarget | None) -> None:
+        was_loading = self._loading
+        self._loading = True
+        selected = self.reference_window.currentData()
+        self.reference_window.clear()
+        if analyte is not None:
+            for window in analyte.windows:
+                self.reference_window.addItem(window.name, window.id)
+        index = self.reference_window.findData(selected)
+        if index >= 0:
+            self.reference_window.setCurrentIndex(index)
+        self._loading = was_loading
+
+    def _update_reference_enabled(self) -> None:
+        self.reference_window.setEnabled(
+            self.trace_mode.currentData() is StabilityTraceMode.REFERENCE_SIC
+        )
+
+    def _mark_unconfirmed(self, *_args) -> None:
+        if not self._loading:
+            self.intervals_confirmed.setChecked(False)
+
+    @staticmethod
+    def _load_optional(enabled, control, value: float | None) -> None:
+        enabled.setChecked(value is not None)
+        if value is not None:
+            control.setValue(value)
 
     def plot_results(
         self,
@@ -546,7 +801,8 @@ class TimePage(QWidget):
         names: dict[str, str],
         project: AnalysisProject,
     ) -> None:
-        self.canvas.axes.clear()
+        self.canvas.figure.clear()
+        self.canvas.axes = self.canvas.figure.add_subplot(111)
         for sample_id, result in results.items():
             values = [_scan_selected_response(scan, project) for scan in result.scans]
             self.canvas.axes.plot(
@@ -560,6 +816,41 @@ class TimePage(QWidget):
         if results:
             self.canvas.axes.legend(fontsize="small")
         self.canvas.set_interval(self.start.value(), self.end.value())
+
+    def plot_stability_assessment(
+        self, assessments: dict, names: dict[str, str]
+    ) -> None:
+        """Plot complete stability traces and every ranked candidate."""
+
+        self.canvas.figure.clear()
+        items = list(assessments.items())
+        axes = []
+        for index, (sample_id, assessment) in enumerate(items, start=1):
+            axis = self.canvas.figure.add_subplot(
+                len(items), 1, index, sharex=axes[0] if axes else None
+            )
+            axes.append(axis)
+            axis.plot(
+                assessment.times_seconds,
+                assessment.trace_responses,
+                linewidth=0.8,
+            )
+            for rank, candidate in enumerate(assessment.candidates, start=1):
+                axis.axvspan(
+                    candidate.start_seconds,
+                    candidate.end_seconds,
+                    alpha=max(0.08, 0.25 - 0.05 * (rank - 1)),
+                    label=f"candidate {rank}",
+                )
+            axis.set_ylabel(names.get(sample_id, sample_id))
+            if index == 1 and assessment.candidates:
+                axis.legend(fontsize="x-small", ncol=len(assessment.candidates))
+        if axes:
+            axes[-1].set_xlabel("Elapsed acquisition time (s)")
+            self.canvas.axes = axes[0]
+        self.canvas.figure.supylabel("Selected stability-trace response")
+        self.canvas.figure.tight_layout()
+        self.canvas.draw_idle()
 
     def _from_plot(self, start: float, end: float) -> None:
         self.start.setValue(start)
@@ -699,8 +990,8 @@ class CalibrationPage(QWidget):
         form.addRow("Intercept", self.force_zero)
         form.addRow(self.residual_limit_enabled, self.residual_limit)
         form.addRow(self.flattening_enabled, self.flattening_limit)
-        run = QPushButton("Fit calibration")
-        run.clicked.connect(self.run_requested)
+        self.run_button = QPushButton("Fit calibration")
+        self.run_button.clicked.connect(self.run_requested)
         self.summary = QLabel("Calibration not fitted")
         self.calibration_canvas = PlotCanvas()
         self.residual_canvas = PlotCanvas()
@@ -727,7 +1018,7 @@ class CalibrationPage(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Calibration"))
         layout.addLayout(form)
-        layout.addWidget(run)
+        layout.addWidget(self.run_button)
         layout.addWidget(self.summary)
         layout.addWidget(plots)
         layout.addWidget(tabs)
@@ -748,6 +1039,18 @@ class CalibrationPage(QWidget):
                 else None
             ),
         )
+
+    def set_run_availability(self, has_results: bool, confirmed: bool) -> None:
+        self.run_button.setEnabled(has_results and confirmed)
+        if not has_results:
+            reason = "Process files before fitting calibration."
+        elif not confirmed:
+            reason = (
+                "Review and explicitly confirm every included sample interval first."
+            )
+        else:
+            reason = "Fit calibration using the confirmed fixed-duration intervals."
+        self.run_button.setToolTip(reason)
 
     def load_settings(
         self, calibration: CalibrationSettings, processing: ProcessingSettings

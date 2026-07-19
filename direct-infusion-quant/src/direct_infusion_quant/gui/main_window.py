@@ -52,8 +52,15 @@ from direct_infusion_quant.gui.workers import (
     MetadataWorker,
     ProcessingBundle,
     ProcessingWorker,
+    StabilityRecommendationBundle,
+    StabilityRecommendationWorker,
 )
-from direct_infusion_quant.models import AnalysisProject, SummaryMethod
+from direct_infusion_quant.models import (
+    AnalysisProject,
+    StabilityAssessmentRecord,
+    StabilityCandidateRecord,
+    SummaryMethod,
+)
 from direct_infusion_quant.persistence import load_project, save_project
 from direct_infusion_quant.processing import FileProcessingResult, WarningThresholds
 
@@ -84,6 +91,7 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker = None
         self._relink_dialog: RelinkFilesDialog | None = None
+        self._loading_pages = False
 
         self.files_page = FilesPage()
         self.targets_page = TargetsPage()
@@ -183,7 +191,14 @@ class MainWindow(QMainWindow):
         self.files_page.add_requested.connect(self.import_mzml_dialog)
         self.files_page.inspect_requested.connect(self.inspect_metadata)
         self.files_page.backend_changed.connect(self._backend_changed)
+        self.files_page.table.itemChanged.connect(self._sample_table_changed)
+        self.targets_page.table.itemChanged.connect(self._target_changed)
+        self.targets_page.name.textChanged.connect(self._target_changed)
         self.time_page.process_requested.connect(self.start_processing)
+        self.time_page.recommendation_requested.connect(self.assess_stable_periods)
+        self.time_page.intervals_confirmed.toggled.connect(
+            lambda: self._update_availability()
+        )
         self.time_page.cancel_requested.connect(self.cancel_work)
         self.calibration_page.run_requested.connect(self.run_calibration)
         self.export_page.csv_requested.connect(self.export_csv)
@@ -192,6 +207,7 @@ class MainWindow(QMainWindow):
         self.export_page.plots_requested.connect(self.export_plots)
 
     def _backend_changed(self, _backend) -> None:
+        self.time_page.intervals_confirmed.setChecked(False)
         if not self.processing_results and self.calibration_result is None:
             return
         self.processing_results.clear()
@@ -205,6 +221,14 @@ class MainWindow(QMainWindow):
             "Reader backend changed; previous processing and calibration results "
             "were cleared. Reprocess all files with the selected backend."
         )
+
+    def _sample_table_changed(self, item) -> None:
+        if not self._loading_pages and item.column() in {0, 8}:
+            self.time_page.intervals_confirmed.setChecked(False)
+
+    def _target_changed(self, *_args) -> None:
+        if not self._loading_pages:
+            self.time_page.intervals_confirmed.setChecked(False)
 
     def new_project(self) -> None:
         if self._thread is not None:
@@ -229,6 +253,7 @@ class MainWindow(QMainWindow):
 
     def add_mzml_files(self, paths: list[Path]) -> None:
         self.files_page.add_paths(paths)
+        self.time_page.intervals_confirmed.setChecked(False)
         self.processing_results.clear()
         self.calibration_result = None
         self._update_availability()
@@ -289,6 +314,112 @@ class MainWindow(QMainWindow):
         )
         self._start_worker(worker)
 
+    def assess_stable_periods(self) -> None:
+        """Report fixed-duration per-file recommendations without applying them."""
+
+        try:
+            project = self._sync_project_from_pages()
+            if project.processing.time_end_seconds is None:
+                raise ValueError("Set a finite default interval first.")
+            if project.active_analyte_id is None:
+                raise ValueError("Define an active analyte and explicit quantifier.")
+        except (ValidationError, ValueError) as error:
+            self._show_validation_error(error)
+            return
+        worker = StabilityRecommendationWorker(project)
+        worker.progress.connect(self._processing_progress)
+        worker.succeeded.connect(self._stability_recommendations_succeeded)
+        worker.failed.connect(self._worker_failed)
+        worker.cancelled.connect(
+            lambda: self._log("Stable-period assessment cancelled.")
+        )
+        self._start_worker(worker)
+
+    def _stability_recommendations_succeeded(
+        self, bundle: StabilityRecommendationBundle
+    ) -> None:
+        project = self._sync_project_from_pages()
+        duration = (
+            project.processing.time_end_seconds - project.processing.time_start_seconds
+        )
+        lines = [
+            f"Fixed duration for every recommendation: {duration:g} s.",
+            f"Stability trace: {project.processing.stability_trace_mode.value}.",
+            "Recommendations were not applied:",
+        ]
+        samples = {str(sample.id): sample for sample in project.samples}
+        for sample_id, assessment in bundle.assessments.items():
+            name = samples[sample_id].sample_name
+            samples[sample_id].stability_assessment = StabilityAssessmentRecord(
+                assessed_at_utc=bundle.assessed_at_utc,
+                trace_mode=project.processing.stability_trace_mode,
+                ambiguous=assessment.ambiguous,
+                candidates=[
+                    StabilityCandidateRecord(
+                        rank=rank,
+                        start_seconds=candidate.start_seconds,
+                        end_seconds=candidate.end_seconds,
+                        scan_count=candidate.scan_count,
+                        trace_median_response=candidate.median_response,
+                        trace_robust_cv_percent=candidate.robust_cv_percent,
+                        trace_relative_drift_percent=(candidate.relative_drift_percent),
+                        trace_zero_fraction=candidate.zero_fraction,
+                        trace_signal_fraction=(candidate.signal_fraction_of_reference),
+                        score=candidate.score,
+                        limit_failures=list(candidate.limit_failures),
+                        analyte_median_response=analyte.median_response,
+                        analyte_robust_cv_percent=analyte.robust_cv_percent,
+                        analyte_relative_drift_percent=(analyte.relative_drift_percent),
+                        analyte_zero_fraction=analyte.zero_fraction,
+                    )
+                    for rank, (candidate, analyte) in enumerate(
+                        zip(
+                            assessment.candidates,
+                            assessment.analyte_diagnostics,
+                            strict=True,
+                        ),
+                        start=1,
+                    )
+                ],
+            )
+            lines.append(
+                f"{name}:"
+                + (" AMBIGUOUS CANDIDATE RANKING" if assessment.ambiguous else "")
+            )
+            for rank, (candidate, analyte) in enumerate(
+                zip(
+                    assessment.candidates,
+                    assessment.analyte_diagnostics,
+                    strict=True,
+                ),
+                start=1,
+            ):
+                limit_text = (
+                    "meets configured limits"
+                    if candidate.meets_limits
+                    else "fails " + ", ".join(candidate.limit_failures)
+                )
+                lines.append(
+                    f"  {rank}. {candidate.start_seconds:.2f}–"
+                    f"{candidate.end_seconds:.2f} s; trace CV "
+                    f"{candidate.robust_cv_percent:.1f}%; trace drift "
+                    f"{candidate.relative_drift_percent:.1f}%; trace zeros "
+                    f"{candidate.zero_fraction:.1%}; analyte CV "
+                    f"{analyte.robust_cv_percent:.1f}%; analyte drift "
+                    f"{analyte.relative_drift_percent:.1f}%; score "
+                    f"{candidate.score:.2f}; {limit_text}."
+                )
+        for sample_id, error in bundle.failures.items():
+            lines.append(f"{samples[sample_id].sample_name}: unavailable ({error}).")
+        message = "\n".join(lines)
+        self.project = project
+        self.time_page.plot_stability_assessment(
+            bundle.assessments,
+            {sample_id: sample.sample_name for sample_id, sample in samples.items()},
+        )
+        self._log(message)
+        QMessageBox.information(self, "Stable-period assessment", message)
+
     def run_calibration(self) -> None:
         if not self.processing_results:
             self._show_error(
@@ -297,6 +428,11 @@ class MainWindow(QMainWindow):
             return
         try:
             self.project = self._sync_project_from_pages()
+            if not self.project.processing.stability_intervals_confirmed:
+                raise ValueError(
+                    "Review and explicitly confirm every included sample's "
+                    "fixed-duration interval before calibration."
+                )
             method = self.calibration_page.response_method.currentData()
             self.project.processing.summary_method = method
             self.project.calibration = self.calibration_page.settings()
@@ -675,6 +811,8 @@ class MainWindow(QMainWindow):
                 and existing_sample.source_provenance is not None
             ):
                 sample.source_provenance = existing_sample.source_provenance
+            if existing_sample is not None and existing_sample.path == sample.path:
+                sample.stability_assessment = existing_sample.stability_assessment
         existing = self.project.analytes[0] if self.project.analytes else None
         analytes = []
         active_id = None
@@ -682,6 +820,7 @@ class MainWindow(QMainWindow):
             analyte = self.targets_page.analyte(existing.id if existing else None)
             analytes = [analyte]
             active_id = analyte.id
+            self.time_page.load_reference_windows(analyte)
         method = self.calibration_page.response_method.currentData()
         processing = self.time_page.settings(method, self.files_page.selected_backend())
         return AnalysisProject(
@@ -698,14 +837,19 @@ class MainWindow(QMainWindow):
         )
 
     def _load_project_into_pages(self) -> None:
-        self.files_page.load_samples(self.project.samples)
-        self.files_page.load_backend(self.project.processing.mzml_backend)
-        analyte = self.project.analytes[0] if self.project.analytes else None
-        self.targets_page.load_analyte(analyte)
-        self.time_page.load_settings(self.project.processing)
-        self.calibration_page.load_settings(
-            self.project.calibration, self.project.processing
-        )
+        self._loading_pages = True
+        try:
+            self.files_page.load_samples(self.project.samples)
+            self.files_page.load_backend(self.project.processing.mzml_backend)
+            analyte = self.project.analytes[0] if self.project.analytes else None
+            self.targets_page.load_analyte(analyte)
+            self.time_page.load_reference_windows(analyte)
+            self.time_page.load_settings(self.project.processing)
+            self.calibration_page.load_settings(
+                self.project.calibration, self.project.processing
+            )
+        finally:
+            self._loading_pages = False
         self.results_page.file_table.setRowCount(0)
         self.results_page.scan_table.setRowCount(0)
         self.calibration_page.summary.setText("Calibration not fitted")
@@ -715,6 +859,10 @@ class MainWindow(QMainWindow):
     def _update_availability(self) -> None:
         self.export_page.set_availability(
             bool(self.processing_results), self.calibration_result is not None
+        )
+        self.calibration_page.set_run_availability(
+            bool(self.processing_results),
+            self.time_page.intervals_confirmed.isChecked(),
         )
 
     def _update_hash_action(self) -> None:

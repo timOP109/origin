@@ -62,6 +62,7 @@ def example_project() -> AnalysisProject:
                 concentration_unit="mg/L",
                 dilution_factor=4.0,
                 replicate_group="level-1",
+                time_start_seconds=20.0,
                 source_provenance=SourceFileProvenance(
                     file_size_bytes=123456,
                     modified_time_ns=1_700_000_000_000_000_000,
@@ -83,6 +84,16 @@ def example_project() -> AnalysisProject:
             time_end_seconds=45.0,
             summary_method=SummaryMethod.TRIMMED_MEAN,
             trim_fraction=0.2,
+            stability_trace_mode="tic",
+            stability_minimum_scans=15,
+            stability_max_robust_cv_percent=12.0,
+            stability_max_relative_drift_percent=8.0,
+            stability_max_zero_fraction=0.05,
+            stability_exclude_before_seconds=5.0,
+            stability_exclude_after_seconds=240.0,
+            stability_candidate_count=3,
+            stability_ambiguity_score_delta_percent=5.0,
+            stability_intervals_confirmed=True,
         ),
         calibration=CalibrationSettings(
             blank_correction=BlankCorrectionMethod.NONE,
@@ -105,9 +116,12 @@ def test_project_round_trip_preserves_all_settings(tmp_path: Path) -> None:
     assert reopened.application_version == project.application_version
     assert reopened.processing == project.processing
     assert reopened.processing.mzml_backend is MzMLBackend.PYOPENMS
+    assert reopened.processing.stability_trace_mode.value == "tic"
+    assert reopened.processing.stability_intervals_confirmed is True
     assert reopened.calibration == project.calibration
     assert reopened.samples[0].dilution_factor == 4.0
     assert reopened.samples[0].concentration_unit == "mg/L"
+    assert reopened.samples[0].time_start_seconds == 20.0
     assert reopened.samples[0].source_provenance == (
         project.samples[0].source_provenance
     )

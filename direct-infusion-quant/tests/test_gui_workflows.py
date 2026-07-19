@@ -9,7 +9,11 @@ from PySide6.QtCore import Qt
 
 from direct_infusion_quant.gui.main_window import MainWindow
 from direct_infusion_quant.gui.pages import TimePage
-from direct_infusion_quant.gui.workers import HashVerificationWorker, ProcessingWorker
+from direct_infusion_quant.gui.workers import (
+    HashVerificationWorker,
+    ProcessingWorker,
+    StabilityRecommendationWorker,
+)
 from direct_infusion_quant.io.base import MzMLMetadata, SpectrumRecord
 from direct_infusion_quant.models import (
     AnalysisProject,
@@ -21,6 +25,7 @@ from direct_infusion_quant.models import (
     SampleRecord,
     SampleType,
     SourceFileProvenance,
+    StabilityTraceMode,
     ToleranceUnit,
 )
 from direct_infusion_quant.processing import WarningThresholds
@@ -70,6 +75,25 @@ def test_main_window_has_ordered_workflow_and_explained_disabled_exports(
     ]
 
 
+def test_new_window_ids_survive_repeated_project_synchronization(
+    qtbot, tmp_path: Path
+) -> None:
+    mzml = tmp_path / "new-window.mzML"
+    mzml.touch()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    configure_valid_project(window, mzml)
+
+    first = window._sync_project_from_pages()
+    window.project = first
+    second = window._sync_project_from_pages()
+
+    first_window = first.analytes[0].windows[0]
+    second_window = second.analytes[0].windows[0]
+    assert second_window.id == first_window.id
+    assert second.analytes[0].quantifier_window_ids == [first_window.id]
+
+
 def test_edit_save_and_reopen_restores_settings_without_embedding_mzml(
     qtbot, tmp_path: Path
 ) -> None:
@@ -109,7 +133,7 @@ def test_reopen_marks_missing_source_without_discarding_settings(
     reopened = MainWindow()
     qtbot.addWidget(reopened)
     assert reopened.open_project_path(project_path)
-    assert reopened.files_page.table.item(0, 8).text() == "Source file is missing"
+    assert reopened.files_page.table.item(0, 9).text() == "Source file is missing"
     assert reopened.targets_page.name.text() == "peptide A"
     qtbot.waitUntil(
         lambda: (
@@ -131,7 +155,7 @@ def test_reopen_marks_missing_source_without_discarding_settings(
     assert reopened.project.processing.time_end_seconds == 10
     assert reopened.project.analytes[0].name == "peptide A"
     assert not reopened.relink_action.isEnabled()
-    assert reopened.files_page.table.item(0, 8).text() == "Not inspected"
+    assert reopened.files_page.table.item(0, 9).text() == "Not inspected"
 
     assert reopened.save_project_path(project_path)
     reopened.new_project()
@@ -210,6 +234,79 @@ def test_processing_worker_returns_scan_results_without_gui_access(
     assert len(page.canvas.axes.lines) >= 3
 
 
+def test_stability_worker_uses_explicit_reference_and_returns_ranked_candidates(
+    qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "stability.mzML"
+    path.touch()
+    quantifier = ExtractionWindow(
+        name="analyte",
+        target_mz=500,
+        tolerance=0.1,
+        tolerance_unit=ToleranceUnit.DA,
+    )
+    reference = ExtractionWindow(
+        name="internal standard",
+        target_mz=600,
+        tolerance=0.1,
+        tolerance_unit=ToleranceUnit.DA,
+    )
+    analyte = AnalyteTarget(
+        name="peptide",
+        windows=[quantifier, reference],
+        quantifier_mode=QuantifierMode.SINGLE,
+        quantifier_window_ids=[quantifier.id],
+    )
+    sample = SampleRecord(
+        path=path, sample_name="sample", sample_type=SampleType.UNKNOWN
+    )
+    project = AnalysisProject(
+        name="stability",
+        samples=[sample],
+        analytes=[analyte],
+        active_analyte_id=analyte.id,
+        processing=ProcessingSettings(
+            time_start_seconds=0,
+            time_end_seconds=10,
+            stability_trace_mode=StabilityTraceMode.REFERENCE_SIC,
+            stability_reference_window_id=reference.id,
+            stability_candidate_count=2,
+            stability_ambiguity_score_delta_percent=1000,
+        ),
+    )
+
+    class FakeReader:
+        def iter_spectra(self, _path: Path):
+            for index in range(61):
+                reference_response = 100.0 if 20 <= index <= 30 else 50.0 + index
+                yield SpectrumRecord(
+                    native_id=f"scan={index}",
+                    index=index,
+                    ms_level=1,
+                    elapsed_time_seconds=float(index),
+                    mz=np.asarray([500.0, 600.0]),
+                    intensity=np.asarray([1000.0 + index, reference_response]),
+                )
+
+    monkeypatch.setattr(
+        "direct_infusion_quant.gui.workers.create_mzml_reader",
+        lambda _backend: FakeReader(),
+    )
+    worker = StabilityRecommendationWorker(project)
+    with qtbot.waitSignal(worker.succeeded, timeout=1000) as signal:
+        worker.run()
+    assessment = signal.args[0].assessments[str(sample.id)]
+    assert assessment.candidates[0].start_seconds == 20
+    assert len(assessment.candidates) == 2
+    assert len(assessment.analyte_diagnostics) == 2
+    assert assessment.ambiguous is True
+
+    cancelled_worker = StabilityRecommendationWorker(project)
+    cancelled_worker.cancel()
+    with qtbot.waitSignal(cancelled_worker.cancelled, timeout=1000):
+        cancelled_worker.run()
+
+
 def test_main_window_keeps_thread_alive_until_processing_finishes(
     qtbot, tmp_path: Path, monkeypatch
 ) -> None:
@@ -275,6 +372,28 @@ def test_backend_change_clears_stale_results(qtbot) -> None:
     assert "previous processing" in window.log_view.toPlainText()
 
 
+def test_relevant_stability_edits_clear_interval_confirmation(
+    qtbot, tmp_path: Path
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    path = tmp_path / "confirmation.mzML"
+    path.touch()
+    window.add_mzml_files([path])
+
+    window.time_page.intervals_confirmed.setChecked(True)
+    window.time_page.ms_level.setValue(2)
+    assert not window.time_page.intervals_confirmed.isChecked()
+
+    window.time_page.intervals_confirmed.setChecked(True)
+    window.files_page.load_backend(MzMLBackend.PYOPENMS)
+    assert not window.time_page.intervals_confirmed.isChecked()
+
+    window.time_page.intervals_confirmed.setChecked(True)
+    window.files_page.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert not window.time_page.intervals_confirmed.isChecked()
+
+
 def test_saved_source_change_is_visible(qtbot, tmp_path: Path) -> None:
     path = tmp_path / "changed.mzML"
     path.write_bytes(b"before")
@@ -299,7 +418,7 @@ def test_saved_source_change_is_visible(qtbot, tmp_path: Path) -> None:
     qtbot.addWidget(window)
     window.project = AnalysisProject(name="changed", samples=[sample])
     window._load_project_into_pages()
-    assert "changed" in window.files_page.table.item(0, 8).text().lower()
+    assert "changed" in window.files_page.table.item(0, 9).text().lower()
 
 
 def test_saved_provenance_is_labelled_without_fresh_inspection(
@@ -329,7 +448,7 @@ def test_saved_provenance_is_labelled_without_fresh_inspection(
     window.project = AnalysisProject(name="saved", samples=[sample])
     window._load_project_into_pages()
 
-    item = window.files_page.table.item(0, 8)
+    item = window.files_page.table.item(0, 9)
     assert item.text() == "Saved metadata: 429 spectra; MS levels [1]; centroided"
     assert "not freshly inspected" in item.toolTip()
     assert captured.isoformat() in item.toolTip()
@@ -373,8 +492,8 @@ def test_explicit_sha256_verification_reports_match_and_mismatch(
 
     window.verify_sha256_now()
     qtbot.waitUntil(lambda: window._thread is None, timeout=3000)
-    assert "verified byte-for-byte" in window.files_page.table.item(0, 8).text()
-    assert "MISMATCH" in window.files_page.table.item(1, 8).text()
+    assert "verified byte-for-byte" in window.files_page.table.item(0, 9).text()
+    assert "MISMATCH" in window.files_page.table.item(1, 9).text()
     assert window.project.samples[1].source_provenance.sha256 == reference_hash
 
 
