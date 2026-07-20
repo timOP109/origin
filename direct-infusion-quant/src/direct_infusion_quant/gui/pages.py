@@ -41,6 +41,7 @@ from direct_infusion_quant.models import (
     QuantifierMode,
     SampleRecord,
     SampleType,
+    SourceFileProvenance,
     StabilityTraceMode,
     SummaryMethod,
     ToleranceUnit,
@@ -83,6 +84,7 @@ class FilesPage(QWidget):
         "Individual start (s)",
         "Metadata / warnings",
     ]
+    SOURCE_PROVENANCE_ROLE = Qt.ItemDataRole.UserRole + 2
 
     def __init__(self) -> None:
         super().__init__()
@@ -168,6 +170,38 @@ class FilesPage(QWidget):
                 self.table.setItem(row, 9, item)
                 return
 
+    def set_source_provenance(
+        self, path: Path, provenance: SourceFileProvenance
+    ) -> None:
+        """Retain inspected provenance on its file row until project synchronization."""
+
+        resolved = path.expanduser().resolve()
+        for row in range(self.table.rowCount()):
+            file_item = self.table.item(row, 1)
+            if file_item is None:
+                continue
+            row_path = Path(file_item.data(Qt.ItemDataRole.UserRole))
+            if row_path.expanduser().resolve() == resolved:
+                file_item.setData(self.SOURCE_PROVENANCE_ROLE, provenance)
+                return
+
+    def included_paths(self) -> list[Path]:
+        """Return paths needed for metadata inspection without parsing other fields."""
+
+        paths: list[Path] = []
+        for row in range(self.table.rowCount()):
+            included_item = self.table.item(row, 0)
+            file_item = self.table.item(row, 1)
+            if included_item is None or file_item is None:
+                raise ValueError(f"File row {row + 1} is incomplete")
+            if included_item.checkState() != Qt.CheckState.Checked:
+                continue
+            path_data = file_item.data(Qt.ItemDataRole.UserRole)
+            if not path_data:
+                raise ValueError(f"File row {row + 1} has no source path")
+            paths.append(Path(path_data))
+        return paths
+
     def set_status(self, sample_id: UUID, text: str, warning: bool = False) -> None:
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 1)
@@ -203,6 +237,7 @@ class FilesPage(QWidget):
                         if self.table.item(row, 8).text().strip()
                         else None
                     ),
+                    source_provenance=file_item.data(self.SOURCE_PROVENANCE_ROLE),
                 )
             )
         return samples
@@ -216,6 +251,7 @@ class FilesPage(QWidget):
             )
             file_item = self.table.item(row, 1)
             file_item.setData(Qt.ItemDataRole.UserRole + 1, str(sample.id))
+            file_item.setData(self.SOURCE_PROVENANCE_ROLE, sample.source_provenance)
             self.table.item(row, 2).setText(sample.sample_name)
             self.table.item(row, 3).setText(sample.sample_type.value)
             self.table.item(row, 4).setText(
@@ -372,23 +408,49 @@ class TargetsPage(QWidget):
         windows: list[ExtractionWindow] = []
         selected: list[UUID] = []
         for row in range(self.table.rowCount()):
-            label_item = self.table.item(row, 2)
-            window_id = label_item.data(Qt.ItemDataRole.UserRole)
-            charge = self.table.item(row, 6).text().strip()
-            identity = {"id": UUID(window_id)} if window_id else {}
-            window = ExtractionWindow(
-                **identity,
-                name=label_item.text().strip(),
-                target_mz=float(self.table.item(row, 3).text()),
-                tolerance=float(self.table.item(row, 4).text()),
-                tolerance_unit=ToleranceUnit(self.table.item(row, 5).text().strip()),
-                charge=int(charge) if charge else None,
-                enabled=self.table.item(row, 0).checkState() == Qt.CheckState.Checked,
-            )
+            items = [
+                self.table.item(row, column) for column in range(len(self.HEADERS))
+            ]
+            missing = [
+                self.HEADERS[column]
+                for column, item in enumerate(items)
+                if item is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Extraction-window row {row + 1} is incomplete; missing "
+                    + ", ".join(missing)
+                )
+            (
+                enabled_item,
+                selected_item,
+                label_item,
+                mz_item,
+                tolerance_item,
+                unit_item,
+                charge_item,
+            ) = items
+            try:
+                window_id = label_item.data(Qt.ItemDataRole.UserRole)
+                charge = charge_item.text().strip()
+                identity = {"id": UUID(window_id)} if window_id else {}
+                window = ExtractionWindow(
+                    **identity,
+                    name=label_item.text().strip(),
+                    target_mz=float(mz_item.text()),
+                    tolerance=float(tolerance_item.text()),
+                    tolerance_unit=ToleranceUnit(unit_item.text().strip()),
+                    charge=int(charge) if charge else None,
+                    enabled=(enabled_item.checkState() == Qt.CheckState.Checked),
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Extraction-window row {row + 1} is invalid: {error}"
+                ) from error
             if not window_id:
                 label_item.setData(Qt.ItemDataRole.UserRole, str(window.id))
             windows.append(window)
-            if self.table.item(row, 1).checkState() == Qt.CheckState.Checked:
+            if selected_item.checkState() == Qt.CheckState.Checked:
                 selected.append(window.id)
         molecular_weight = self.molecular_weight.value()
         identity = {"id": existing_id} if existing_id else {}
@@ -489,7 +551,7 @@ class TimePage(QWidget):
             control.setRange(0, 1_000_000)
             control.setDecimals(4)
             control.setSuffix(" s")
-        self.end.setValue(60)
+        self.end.setSpecialValueText("Not set")
         self.trim_fraction = QDoubleSpinBox()
         self.trim_fraction.setRange(0, 0.49)
         self.trim_fraction.setSingleStep(0.05)
@@ -665,11 +727,12 @@ class TimePage(QWidget):
     def settings(
         self, method: SummaryMethod, backend: MzMLBackend
     ) -> ProcessingSettings:
+        end_seconds = self.end.value()
         return ProcessingSettings(
             ms_level=self.ms_level.value(),
             mzml_backend=backend,
             time_start_seconds=self.start.value(),
-            time_end_seconds=self.end.value(),
+            time_end_seconds=end_seconds if end_seconds > 0 else None,
             summary_method=method,
             trim_fraction=self.trim_fraction.value(),
             stability_trace_mode=self.trace_mode.currentData(),
@@ -716,7 +779,9 @@ class TimePage(QWidget):
         self._loading = True
         self.ms_level.setValue(settings.ms_level)
         self.start.setValue(settings.time_start_seconds)
-        self.end.setValue(settings.time_end_seconds or 0)
+        self.end.setValue(
+            settings.time_end_seconds if settings.time_end_seconds is not None else 0
+        )
         self.trim_fraction.setValue(settings.trim_fraction)
         self.trace_mode.setCurrentIndex(
             self.trace_mode.findData(settings.stability_trace_mode)

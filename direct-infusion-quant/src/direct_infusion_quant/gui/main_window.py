@@ -57,6 +57,7 @@ from direct_infusion_quant.gui.workers import (
 )
 from direct_infusion_quant.models import (
     AnalysisProject,
+    SampleRecord,
     StabilityAssessmentRecord,
     StabilityCandidateRecord,
     SummaryMethod,
@@ -261,16 +262,16 @@ class MainWindow(QMainWindow):
 
     def inspect_metadata(self) -> None:
         try:
-            project = self._sync_project_from_pages()
-        except (ValidationError, ValueError) as error:
+            paths = self.files_page.included_paths()
+            backend = self.files_page.selected_backend()
+        except ValueError as error:
             self._show_validation_error(error)
             return
-        self.project = project
-        paths = [sample.path for sample in project.samples if sample.included]
         if not paths:
             self._show_error("No files", "Add and include at least one mzML file.")
             return
-        worker = MetadataWorker(paths, project.processing.mzml_backend)
+        self.project.processing.mzml_backend = backend
+        worker = MetadataWorker(paths, backend)
         worker.metadata.connect(self._metadata_received)
         worker.failed.connect(self._metadata_failed)
         worker.progress.connect(self._metadata_progress)
@@ -283,6 +284,10 @@ class MainWindow(QMainWindow):
                 sample.included for sample in project.samples
             ):
                 raise ValueError("Add and include at least one mzML file.")
+            if project.processing.time_end_seconds is None:
+                raise ValueError(
+                    "Set a default acquisition-time end before processing files."
+                )
             if project.active_analyte_id is None:
                 raise ValueError("Define an active analyte and explicit quantifier.")
         except (ValidationError, ValueError) as error:
@@ -763,9 +768,17 @@ class MainWindow(QMainWindow):
 
     def _metadata_received(self, path: Path, provenance) -> None:
         metadata = provenance
+        self.files_page.set_source_provenance(path, provenance)
         for sample in self.project.samples:
             if sample.path.expanduser().resolve() == path.expanduser().resolve():
                 sample.source_provenance = provenance
+        try:
+            self.project.samples = self._samples_from_files_page()
+        except (AttributeError, TypeError, ValidationError, ValueError) as error:
+            # Metadata inspection deliberately remains independent of draft sample
+            # classification and concentration fields. The file row retains the
+            # provenance for the next successful project synchronization.
+            LOGGER.debug("metadata provenance pending project sync: %s", error)
         mode = (
             "centroided"
             if metadata.is_centroided is True
@@ -796,7 +809,7 @@ class MainWindow(QMainWindow):
         self._log(f"Error: {message}")
         self._show_error("Background processing failed", message)
 
-    def _sync_project_from_pages(self) -> AnalysisProject:
+    def _samples_from_files_page(self) -> list[SampleRecord]:
         samples = self.files_page.samples()
         for row, sample in enumerate(samples):
             self.files_page.table.item(row, 1).setData(
@@ -809,10 +822,15 @@ class MainWindow(QMainWindow):
                 existing_sample is not None
                 and existing_sample.path == sample.path
                 and existing_sample.source_provenance is not None
+                and sample.source_provenance is None
             ):
                 sample.source_provenance = existing_sample.source_provenance
             if existing_sample is not None and existing_sample.path == sample.path:
                 sample.stability_assessment = existing_sample.stability_assessment
+        return samples
+
+    def _sync_project_from_pages(self) -> AnalysisProject:
+        samples = self._samples_from_files_page()
         existing = self.project.analytes[0] if self.project.analytes else None
         analytes = []
         active_id = None
