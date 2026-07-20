@@ -66,6 +66,26 @@ class WeightingMode(StrEnum):
     INVERSE_X_SQUARED = "1/x^2"
 
 
+class RegressionModel(StrEnum):
+    """Explicit calibration response model selected by the user."""
+
+    LINEAR = "linear"
+    QUADRATIC = "quadratic"
+    CUBIC = "cubic"
+    QUARTIC = "quartic"
+
+    @property
+    def degree(self) -> int:
+        """Return the polynomial degree represented by this model."""
+
+        return {
+            RegressionModel.LINEAR: 1,
+            RegressionModel.QUADRATIC: 2,
+            RegressionModel.CUBIC: 3,
+            RegressionModel.QUARTIC: 4,
+        }[self]
+
+
 class BlankCorrectionMethod(StrEnum):
     """Supported file-response blank correction methods."""
 
@@ -129,14 +149,8 @@ class ExtractionWindow(ProjectModel):
     target_mz: float = Field(gt=0)
     tolerance: float = Field(gt=0)
     tolerance_unit: ToleranceUnit
-    charge: int | None = None
+    charge: int | None = Field(default=None, ge=1, le=15)
     enabled: bool = True
-
-    @model_validator(mode="after")
-    def validate_charge(self) -> ExtractionWindow:
-        if self.charge == 0:
-            raise ValueError("charge must be non-zero when supplied")
-        return self
 
 
 class AnalyteTarget(ProjectModel):
@@ -160,6 +174,9 @@ class AnalyteTarget(ProjectModel):
             raise ValueError("extraction window names must be unique")
         if any(window_id not in window_ids for window_id in selected):
             raise ValueError("quantifier selection references an unknown window")
+        enabled_ids = {window.id for window in self.windows if window.enabled}
+        if any(window_id not in enabled_ids for window_id in selected):
+            raise ValueError("quantifier selection references a disabled window")
         if self.quantifier_mode is None and selected:
             raise ValueError("quantifier mode is required when windows are selected")
         if self.quantifier_mode is QuantifierMode.SINGLE and len(selected) != 1:
@@ -240,14 +257,26 @@ class ProcessingSettings(ProjectModel):
 
 
 class CalibrationSettings(ProjectModel):
-    """Explicit version-one linear calibration choices."""
+    """Explicit calibration model and method-specific diagnostic choices."""
 
     blank_correction: BlankCorrectionMethod = BlankCorrectionMethod.POOLED_MEDIAN
+    regression_model: RegressionModel = RegressionModel.LINEAR
     weighting: WeightingMode = WeightingMode.NONE
     force_through_zero: bool = False
     large_residual_absolute: float | None = Field(default=None, gt=0)
     large_residual_percent: float | None = Field(default=None, gt=0)
     upper_flattening_slope_ratio: float | None = Field(default=None, gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def validate_regression_options(self) -> CalibrationSettings:
+        if (
+            self.regression_model is not RegressionModel.LINEAR
+            and self.force_through_zero
+        ):
+            raise ValueError(
+                "force through zero is supported only for linear calibration"
+            )
+        return self
 
 
 class AnalysisProject(ProjectModel):

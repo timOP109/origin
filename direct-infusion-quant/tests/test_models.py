@@ -46,6 +46,18 @@ def test_window_requires_positive_mz_and_tolerance() -> None:
         )
 
 
+@pytest.mark.parametrize("charge", [-1, 0, 16])
+def test_window_charge_is_optional_or_positive_one_to_fifteen(charge: int) -> None:
+    with pytest.raises(ValidationError):
+        ExtractionWindow(
+            name="invalid charge",
+            target_mz=500,
+            tolerance=0.1,
+            tolerance_unit=ToleranceUnit.DA,
+            charge=charge,
+        )
+
+
 def test_invalid_time_interval_is_rejected() -> None:
     with pytest.raises(ValidationError):
         ProcessingSettings(time_start_seconds=10, time_end_seconds=10)
@@ -96,3 +108,15 @@ def test_explicit_single_quantifier_is_valid() -> None:
         name="project", analytes=[analyte], active_analyte_id=analyte.id
     )
     assert project.active_analyte_id == analyte.id
+
+
+def test_disabled_window_cannot_be_selected_as_quantifier() -> None:
+    window = make_window()
+    window.enabled = False
+    with pytest.raises(ValidationError, match="disabled window"):
+        AnalyteTarget(
+            name="peptide",
+            windows=[window],
+            quantifier_mode=QuantifierMode.SINGLE,
+            quantifier_window_ids=[window.id],
+        )

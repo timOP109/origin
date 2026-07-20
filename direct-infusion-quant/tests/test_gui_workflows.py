@@ -3,12 +3,14 @@
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHeaderView
 
 from direct_infusion_quant.gui.main_window import MainWindow
-from direct_infusion_quant.gui.pages import TimePage
+from direct_infusion_quant.gui.pages import CONCENTRATION_UNITS, TimePage
 from direct_infusion_quant.gui.workers import (
     HashVerificationWorker,
     ProcessingWorker,
@@ -22,6 +24,7 @@ from direct_infusion_quant.models import (
     MzMLBackend,
     ProcessingSettings,
     QuantifierMode,
+    RegressionModel,
     SampleRecord,
     SampleType,
     SourceFileProvenance,
@@ -34,9 +37,11 @@ from direct_infusion_quant.processing import WarningThresholds
 def configure_valid_project(window: MainWindow, mzml_path: Path) -> None:
     window.add_mzml_files([mzml_path])
     files = window.files_page.table
-    files.item(0, 3).setText(SampleType.STANDARD.value)
+    sample_type = files.cellWidget(0, 3)
+    sample_type.setCurrentIndex(sample_type.findData(SampleType.STANDARD))
     files.item(0, 4).setText("1.5")
-    files.item(0, 5).setText("mg/L")
+    unit = files.cellWidget(0, 5)
+    unit.setCurrentIndex(unit.findData("mg/mL"))
     files.item(0, 6).setText("2")
     window.targets_page.name.setText("peptide A")
     window.targets_page.add_window()
@@ -73,6 +78,69 @@ def test_main_window_has_ordered_workflow_and_explained_disabled_exports(
         "Export…",
         "Exit",
     ]
+
+
+def test_controlled_sample_target_and_calibration_choices(
+    qtbot, tmp_path: Path
+) -> None:
+    path = tmp_path / "controls.mzML"
+    path.touch()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.add_mzml_files([path])
+
+    sample_type = window.files_page.table.cellWidget(0, 3)
+    assert not sample_type.isEditable()
+    assert [sample_type.itemText(index) for index in range(sample_type.count())] == [
+        "Unknown (sample)",
+        "Standard",
+        "Blank",
+        "QC",
+    ]
+    concentration_unit = window.files_page.table.cellWidget(0, 5)
+    assert not concentration_unit.isEditable()
+    assert [
+        concentration_unit.itemData(index)
+        for index in range(1, concentration_unit.count())
+    ] == list(CONCENTRATION_UNITS)
+
+    add_button = next(
+        button
+        for button in window.targets_page.findChildren(
+            type(window.export_page.csv_button)
+        )
+        if button.text() == "Add window"
+    )
+    qtbot.mouseClick(add_button, Qt.MouseButton.LeftButton)
+    assert window.targets_page.table.rowCount() == 1
+    assert (
+        window.targets_page.table.item(0, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable
+    )
+    assert (
+        window.targets_page.table.item(0, 1).flags() & Qt.ItemFlag.ItemIsUserCheckable
+    )
+    tolerance_unit = window.targets_page.table.cellWidget(0, 5)
+    charge = window.targets_page.table.cellWidget(0, 6)
+    assert [tolerance_unit.itemText(i) for i in range(tolerance_unit.count())] == [
+        "Da",
+        "ppm",
+    ]
+    assert charge.itemData(0) is None
+    assert charge.itemData(charge.count() - 1) == 15
+    target_header = window.targets_page.table.horizontalHeader()
+    assert target_header.sectionResizeMode(2) is QHeaderView.ResizeMode.Stretch
+    assert target_header.sectionResizeMode(6) is QHeaderView.ResizeMode.ResizeToContents
+
+    window.calibration_page.set_standard_level_count(6)
+    quartic_index = window.calibration_page.regression.findData(RegressionModel.QUARTIC)
+    quartic_item = window.calibration_page.regression.model().item(quartic_index)
+    assert not quartic_item.isEnabled()
+    window.calibration_page.set_standard_level_count(7)
+    assert quartic_item.isEnabled()
+
+    window.targets_page.table.selectRow(0)
+    window.targets_page.remove_selected()
+    assert window.targets_page.table.rowCount() == 0
 
 
 def test_new_window_ids_survive_repeated_project_synchronization(
@@ -232,6 +300,40 @@ def test_processing_worker_returns_scan_results_without_gui_access(
     page.plot_results(results, names, project)
     page.plot_results(results, names, project)
     assert len(page.canvas.axes.lines) >= 3
+
+
+def test_stability_plot_uses_scrollable_readable_sample_panels(qtbot) -> None:
+    page = TimePage()
+    qtbot.addWidget(page)
+    assessments = {}
+    names = {}
+    for index in range(6):
+        sample_id = f"sample-{index}"
+        names[sample_id] = f"Standard {index + 1}"
+        assessments[sample_id] = SimpleNamespace(
+            times_seconds=np.asarray([0.0, 30.0, 60.0, 90.0]),
+            trace_responses=np.asarray(
+                [1000.0 + index, 1100.0 + index, 1050.0 + index, 1025.0 + index]
+            ),
+            candidates=[
+                SimpleNamespace(start_seconds=20.0, end_seconds=50.0),
+                SimpleNamespace(start_seconds=55.0, end_seconds=85.0),
+            ],
+        )
+
+    page.plot_stability_assessment(assessments, names)
+
+    axes = page.canvas.figure.axes
+    assert page.plot_scroll.widget() is page.canvas
+    assert len(axes) == 6
+    assert page.canvas.minimumHeight() >= 6 * page.STABILITY_PANEL_HEIGHT
+    assert [axis.get_title(loc="left") for axis in axes] == list(names.values())
+    assert not any(label.get_visible() for label in axes[0].get_xticklabels())
+    assert any(label.get_visible() for label in axes[-1].get_xticklabels())
+    assert all(not axis.get_ylabel() for axis in axes)
+
+    page.plot_results({}, {}, AnalysisProject(name="plot reset"))
+    assert page.canvas.minimumHeight() == page.BASE_PLOT_HEIGHT
 
 
 def test_stability_worker_uses_explicit_reference_and_returns_ranked_candidates(

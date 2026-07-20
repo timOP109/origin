@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import comb
 
 import numpy as np
 import statsmodels.api as sm
@@ -10,6 +11,7 @@ import statsmodels.api as sm
 from direct_infusion_quant.models import (
     BlankCorrectionMethod,
     CalibrationSettings,
+    RegressionModel,
     SampleType,
     WeightingMode,
 )
@@ -79,6 +81,11 @@ class QuantifiedSample:
 class CalibrationResult:
     """Regression coefficients, diagnostics, and per-file quantification."""
 
+    regression_model: RegressionModel
+    polynomial_coefficients: tuple[float, ...]
+    coefficient_standard_errors: tuple[float | None, ...]
+    residual_degrees_of_freedom: int
+    design_condition_number: float
     slope: float
     intercept: float
     slope_standard_error: float | None
@@ -91,11 +98,19 @@ class CalibrationResult:
     samples: tuple[QuantifiedSample, ...]
     warnings: tuple[CalibrationWarning, ...]
 
+    def predict_response(self, concentration: float | np.ndarray) -> float | np.ndarray:
+        """Evaluate the fitted response using coefficients in ascending order."""
+
+        predicted = np.polynomial.polynomial.polyval(
+            concentration, self.polynomial_coefficients
+        )
+        return float(predicted) if np.ndim(predicted) == 0 else predicted
+
 
 def calibrate_and_quantify(
     samples: list[CalibrationInput], settings: CalibrationSettings
 ) -> CalibrationResult:
-    """Fit a version-one calibration and inverse-predict QC/unknown samples."""
+    """Fit the explicitly selected model and inverse-predict QC/unknown samples."""
 
     standards = [
         sample for sample in samples if sample.sample_type is SampleType.STANDARD
@@ -147,6 +162,7 @@ def calibrate_and_quantify(
             "concentration."
         )
 
+    unique_levels = np.unique(x)
     unique_nonzero_levels = np.unique(x[x > 0])
     if unique_nonzero_levels.size < 3:
         warnings.append(
@@ -158,31 +174,28 @@ def calibrate_and_quantify(
             )
         )
 
-    parameter_count = 1 if settings.force_through_zero else 2
+    degree = settings.regression_model.degree
+    if degree > 1:
+        required_levels = degree + 3
+        if unique_levels.size < required_levels:
+            raise CalibrationError(
+                f"{settings.regression_model.value.title()} calibration requires at "
+                f"least {required_levels} distinct standard levels; "
+                f"{unique_levels.size} were supplied."
+            )
+    parameter_count = 1 if settings.force_through_zero else degree + 1
     if x.size < parameter_count:
         raise CalibrationError("insufficient standards for the selected regression")
-    design = x[:, None] if settings.force_through_zero else sm.add_constant(x)
-    weights = _weights(x, settings.weighting)
-    fitted = sm.WLS(y, design, weights=weights).fit()
-    residual_df = int(x.size - parameter_count)
-    if settings.force_through_zero:
-        intercept = 0.0
-        slope = float(fitted.params[0])
-        intercept_standard_error = None
-        slope_standard_error = (
-            _finite_or_none(fitted.bse[0]) if residual_df > 0 else None
-        )
-    else:
-        intercept = float(fitted.params[0])
-        slope = float(fitted.params[1])
-        intercept_standard_error = (
-            _finite_or_none(fitted.bse[0]) if residual_df > 0 else None
-        )
-        slope_standard_error = (
-            _finite_or_none(fitted.bse[1]) if residual_df > 0 else None
-        )
 
-    predicted_standards = intercept + slope * x
+    (
+        coefficients,
+        coefficient_standard_errors,
+        residual_df,
+        condition_number,
+    ) = _fit_polynomial(x, y, settings)
+    if degree == 1 and coefficients[1] == 0:
+        raise CalibrationError("inverse prediction is undefined for a zero slope")
+    predicted_standards = np.polynomial.polynomial.polyval(x, coefficients)
     residuals = y - predicted_standards
     rmse = float(np.sqrt(np.mean(np.square(residuals))))
     residual_standard_error = (
@@ -197,22 +210,42 @@ def calibrate_and_quantify(
         else None
     )
 
-    warnings.extend(_shape_warnings(x, y, slope, settings))
+    if degree > 1 and not _is_monotonic_over_range(
+        coefficients, float(np.min(x)), float(np.max(x))
+    ):
+        warning = CalibrationWarning(
+            code="non_monotonic_fitted_curve",
+            message=(
+                "The fitted polynomial is not monotonic across the calibrated "
+                "concentration range; inverse quantification is ambiguous."
+            ),
+        )
+        raise CalibrationError(warning.message, (warning,))
+
+    warnings.extend(_shape_warnings(x, y, coefficients, settings))
     quantified = _quantify_samples(
         samples,
         standards,
         blank_response,
         concentration_unit,
-        slope,
-        intercept,
+        coefficients,
         settings,
         warnings,
     )
+    intercept = float(coefficients[0])
+    slope = float(coefficients[1])
+    intercept_se = coefficient_standard_errors[0]
+    slope_se = coefficient_standard_errors[1]
     return CalibrationResult(
+        regression_model=settings.regression_model,
+        polynomial_coefficients=tuple(float(value) for value in coefficients),
+        coefficient_standard_errors=tuple(coefficient_standard_errors),
+        residual_degrees_of_freedom=residual_df,
+        design_condition_number=condition_number,
         slope=slope,
         intercept=intercept,
-        slope_standard_error=slope_standard_error,
-        intercept_standard_error=intercept_standard_error,
+        slope_standard_error=slope_se,
+        intercept_standard_error=intercept_se,
         r_squared=r_squared,
         rmse=rmse,
         residual_standard_error=residual_standard_error,
@@ -221,6 +254,56 @@ def calibrate_and_quantify(
         samples=tuple(quantified),
         warnings=tuple(warnings),
     )
+
+
+def _fit_polynomial(
+    x: np.ndarray, y: np.ndarray, settings: CalibrationSettings
+) -> tuple[np.ndarray, tuple[float | None, ...], int, float]:
+    degree = settings.regression_model.degree
+    weights = _weights(x, settings.weighting)
+    if settings.force_through_zero:
+        design = x[:, None]
+        transform = np.asarray([[0.0], [1.0]])
+    elif degree == 1:
+        design = sm.add_constant(x)
+        transform = np.eye(2)
+    else:
+        centre = float((np.min(x) + np.max(x)) / 2.0)
+        scale = float((np.max(x) - np.min(x)) / 2.0)
+        if scale == 0:
+            raise CalibrationError("polynomial calibration requires distinct levels")
+        z = (x - centre) / scale
+        design = np.polynomial.polynomial.polyvander(z, degree)
+        transform = _scaled_to_raw_transform(degree, centre, scale)
+    if np.linalg.matrix_rank(design) < design.shape[1]:
+        raise CalibrationError("calibration design matrix is rank deficient")
+    fitted = sm.WLS(y, design, weights=weights).fit()
+    residual_df = int(x.size - design.shape[1])
+    coefficients = transform @ np.asarray(fitted.params, dtype=np.float64)
+    if residual_df > 0:
+        covariance = transform @ np.asarray(fitted.cov_params()) @ transform.T
+        standard_errors = tuple(
+            _finite_or_none(float(np.sqrt(max(value, 0.0))))
+            for value in np.diag(covariance)
+        )
+        if settings.force_through_zero:
+            standard_errors = (None, standard_errors[1])
+    else:
+        standard_errors = tuple(None for _ in range(degree + 1))
+    condition_number = float(np.linalg.cond(design))
+    return coefficients, standard_errors, residual_df, condition_number
+
+
+def _scaled_to_raw_transform(degree: int, centre: float, scale: float) -> np.ndarray:
+    transform = np.zeros((degree + 1, degree + 1), dtype=np.float64)
+    for scaled_power in range(degree + 1):
+        for raw_power in range(scaled_power + 1):
+            transform[raw_power, scaled_power] = (
+                comb(scaled_power, raw_power)
+                * (-centre) ** (scaled_power - raw_power)
+                / scale**scaled_power
+            )
+    return transform
 
 
 def _weights(x: np.ndarray, weighting: WeightingMode) -> np.ndarray:
@@ -236,13 +319,10 @@ def _quantify_samples(
     standards: list[CalibrationInput],
     blank_response: float,
     concentration_unit: str,
-    slope: float,
-    intercept: float,
+    coefficients: np.ndarray,
     settings: CalibrationSettings,
     warnings: list[CalibrationWarning],
 ) -> list[QuantifiedSample]:
-    if slope == 0:
-        raise CalibrationError("inverse prediction is undefined for a zero slope")
     standard_x = np.asarray(
         [sample.concentration for sample in standards], dtype=np.float64
     )
@@ -250,27 +330,54 @@ def _quantify_samples(
     quantified: list[QuantifiedSample] = []
     for sample in samples:
         corrected = sample.file_response - blank_response
-        calculated = (corrected - intercept) / slope
+        calculated, inverse_status = _inverse_prediction(
+            corrected,
+            coefficients,
+            minimum,
+            maximum,
+            allow_extrapolation=settings.regression_model is RegressionModel.LINEAR,
+        )
         is_standard = sample.sample_type is SampleType.STANDARD
         predicted = (
-            intercept + slope * float(sample.concentration) if is_standard else None
+            float(
+                np.polynomial.polynomial.polyval(
+                    float(sample.concentration), coefficients
+                )
+            )
+            if is_standard
+            else None
         )
         residual = corrected - predicted if predicted is not None else None
         percent_error = (
             (calculated - float(sample.concentration))
             / float(sample.concentration)
             * 100.0
-            if is_standard and sample.concentration != 0
+            if is_standard and sample.concentration != 0 and calculated is not None
             else None
         )
-        if (
-            sample.sample_type is SampleType.UNKNOWN
-            and not minimum <= calculated <= maximum
-        ):
+        should_warn_inverse = inverse_status is not None and (
+            settings.regression_model is not RegressionModel.LINEAR
+            or sample.sample_type is SampleType.UNKNOWN
+        )
+        if should_warn_inverse and sample.sample_type in {
+            SampleType.STANDARD,
+            SampleType.QC,
+            SampleType.UNKNOWN,
+        }:
+            code = (
+                "extrapolated_unknown"
+                if sample.sample_type is SampleType.UNKNOWN
+                else inverse_status
+            )
+            message = (
+                "Unknown concentration is outside the standard range."
+                if calculated is not None
+                else "No unique inverse concentration inside the calibrated range."
+            )
             warnings.append(
                 CalibrationWarning(
-                    code="extrapolated_unknown",
-                    message="Unknown concentration is outside the standard range.",
+                    code=code,
+                    message=message,
                     sample_id=sample.sample_id,
                 )
             )
@@ -301,20 +408,81 @@ def _quantify_samples(
     return quantified
 
 
+def _inverse_prediction(
+    response: float,
+    coefficients: np.ndarray,
+    minimum: float,
+    maximum: float,
+    *,
+    allow_extrapolation: bool,
+) -> tuple[float | None, str | None]:
+    adjusted = np.asarray(coefficients, dtype=np.float64).copy()
+    adjusted[0] -= response
+    roots = np.polynomial.polynomial.polyroots(adjusted)
+    real_roots = sorted(
+        float(root.real)
+        for root in roots
+        if abs(root.imag) <= 1e-8 * max(1.0, abs(root.real))
+    )
+    unique_roots: list[float] = []
+    for root in real_roots:
+        if not unique_roots or not np.isclose(
+            root, unique_roots[-1], rtol=1e-9, atol=1e-12
+        ):
+            unique_roots.append(root)
+    range_tolerance = max(1e-12, (maximum - minimum) * 1e-9)
+    in_range = [
+        root
+        for root in unique_roots
+        if minimum - range_tolerance <= root <= maximum + range_tolerance
+    ]
+    if len(in_range) == 1:
+        return min(max(in_range[0], minimum), maximum), None
+    if allow_extrapolation and len(unique_roots) == 1:
+        return unique_roots[0], "inverse_prediction_outside_range"
+    return None, (
+        "ambiguous_inverse_prediction"
+        if len(in_range) > 1
+        else "inverse_prediction_outside_range"
+    )
+
+
+def _is_monotonic_over_range(
+    coefficients: np.ndarray, minimum: float, maximum: float
+) -> bool:
+    derivative = np.polynomial.polynomial.polyder(coefficients)
+    grid = np.linspace(minimum, maximum, 1001)
+    values = np.polynomial.polynomial.polyval(grid, derivative)
+    scale = max(1.0, float(np.max(np.abs(values))))
+    tolerance = scale * 1e-10
+    nondecreasing = bool(np.all(values >= -tolerance) and np.any(values > tolerance))
+    nonincreasing = bool(np.all(values <= tolerance) and np.any(values < -tolerance))
+    return nondecreasing or nonincreasing
+
+
 def _shape_warnings(
     x: np.ndarray,
     y: np.ndarray,
-    slope: float,
+    coefficients: np.ndarray,
     settings: CalibrationSettings,
 ) -> list[CalibrationWarning]:
     warnings: list[CalibrationWarning] = []
-    if slope < 0:
+    levels = np.unique(x)
+    predicted_limits = np.polynomial.polynomial.polyval(
+        [float(levels[0]), float(levels[-1])], coefficients
+    )
+    overall_slope = (
+        float((predicted_limits[1] - predicted_limits[0]) / (levels[-1] - levels[0]))
+        if levels.size > 1
+        else float(coefficients[1])
+    )
+    if overall_slope < 0:
         warnings.append(
             CalibrationWarning(
-                code="negative_slope", message="Calibration slope is negative."
+                code="negative_slope", message="Calibration trend is negative."
             )
         )
-    level_responses = [float(np.median(y[x == level])) for level in np.unique(x)]
+    level_responses = [float(np.median(y[x == level])) for level in levels]
     if any(
         right <= left
         for left, right in zip(level_responses, level_responses[1:], strict=False)
@@ -326,12 +494,11 @@ def _shape_warnings(
             )
         )
     ratio_limit = settings.upper_flattening_slope_ratio
-    levels = np.unique(x)
-    if ratio_limit is not None and levels.size >= 3 and slope > 0:
-        top_slope = (level_responses[-1] - level_responses[-2]) / (
-            levels[-1] - levels[-2]
+    if ratio_limit is not None and levels.size >= 3 and overall_slope > 0:
+        top_slope = float(
+            (level_responses[-1] - level_responses[-2]) / (levels[-1] - levels[-2])
         )
-        if top_slope / slope <= ratio_limit:
+        if top_slope / overall_slope <= ratio_limit:
             warnings.append(
                 CalibrationWarning(
                     code="possible_upper_range_flattening",

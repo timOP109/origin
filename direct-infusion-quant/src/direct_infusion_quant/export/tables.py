@@ -276,7 +276,14 @@ def _processing_settings(project: AnalysisProject) -> list[dict[str, Any]]:
             "value": processing.stability_intervals_confirmed,
         },
         {"setting": "blank_method", "value": calibration.blank_correction.value},
-        {"setting": "regression_model", "value": "linear"},
+        {
+            "setting": "regression_model",
+            "value": calibration.regression_model.value,
+        },
+        {
+            "setting": "polynomial_order",
+            "value": calibration.regression_model.degree,
+        },
         {"setting": "weighting", "value": calibration.weighting.value},
         {
             "setting": "force_through_zero",
@@ -298,19 +305,27 @@ def _calibration_tables(
 ) -> None:
     if calibration is None:
         return
-    tables["Calibration Statistics"].append(
-        {
-            "slope": calibration.slope,
-            "intercept": calibration.intercept,
-            "slope_standard_error": calibration.slope_standard_error,
-            "intercept_standard_error": calibration.intercept_standard_error,
-            "r_squared": calibration.r_squared,
-            "rmse": calibration.rmse,
-            "residual_standard_error": calibration.residual_standard_error,
-            "blank_response": calibration.blank_response,
-            "concentration_unit": calibration.concentration_unit,
-        }
-    )
+    statistics = {
+        "regression_model": calibration.regression_model.value,
+        "polynomial_order": calibration.regression_model.degree,
+        "slope": calibration.slope,
+        "intercept": calibration.intercept,
+        "slope_standard_error": calibration.slope_standard_error,
+        "intercept_standard_error": calibration.intercept_standard_error,
+        "r_squared": calibration.r_squared,
+        "rmse": calibration.rmse,
+        "residual_standard_error": calibration.residual_standard_error,
+        "blank_response": calibration.blank_response,
+        "concentration_unit": calibration.concentration_unit,
+        "residual_degrees_of_freedom": (calibration.residual_degrees_of_freedom),
+        "design_condition_number": calibration.design_condition_number,
+    }
+    for power, coefficient in enumerate(calibration.polynomial_coefficients):
+        statistics[f"coefficient_c{power}"] = coefficient
+        statistics[f"coefficient_c{power}_standard_error"] = (
+            calibration.coefficient_standard_errors[power]
+        )
+    tables["Calibration Statistics"].append(statistics)
     for result in calibration.samples:
         source = samples[result.sample_id]
         base = {

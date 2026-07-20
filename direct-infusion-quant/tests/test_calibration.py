@@ -12,6 +12,7 @@ from direct_infusion_quant.calibration import (
 from direct_infusion_quant.models import (
     BlankCorrectionMethod,
     CalibrationSettings,
+    RegressionModel,
     SampleType,
     WeightingMode,
 )
@@ -116,6 +117,7 @@ def test_force_zero_and_weighting_options_fit() -> None:
         )
         assert result.slope == pytest.approx(2.0)
         assert result.intercept == 0
+        assert result.intercept_standard_error is None
 
 
 def test_configured_warnings_do_not_remove_samples() -> None:
@@ -148,3 +150,72 @@ def test_absent_blank_and_few_levels_warn() -> None:
         "absent_blanks",
         "fewer_than_three_nonzero_levels",
     }
+
+
+def test_exact_quadratic_reference_fit_and_inverse_prediction() -> None:
+    standards = [standard(f"s{x}", x, 1 + 2 * x + 3 * x**2) for x in range(5)]
+    standards.append(CalibrationInput("u", SampleType.UNKNOWN, 24.75))
+    result = calibrate_and_quantify(
+        standards,
+        CalibrationSettings(
+            blank_correction=BlankCorrectionMethod.NONE,
+            regression_model=RegressionModel.QUADRATIC,
+        ),
+    )
+    assert result.regression_model is RegressionModel.QUADRATIC
+    assert result.polynomial_coefficients == pytest.approx((1, 2, 3))
+    assert result.r_squared == pytest.approx(1)
+    unknown = next(sample for sample in result.samples if sample.sample_id == "u")
+    assert unknown.measured_concentration == pytest.approx(2.5)
+    assert unknown.dilution_corrected_concentration == pytest.approx(2.5)
+
+
+@pytest.mark.parametrize(
+    ("model", "levels"),
+    [
+        (RegressionModel.QUADRATIC, 4),
+        (RegressionModel.CUBIC, 5),
+        (RegressionModel.QUARTIC, 6),
+    ],
+)
+def test_polynomial_models_require_degree_plus_three_distinct_levels(
+    model: RegressionModel, levels: int
+) -> None:
+    with pytest.raises(CalibrationError, match="distinct standard levels"):
+        calibrate_and_quantify(
+            [standard(f"s{x}", x, 1 + x) for x in range(levels)],
+            CalibrationSettings(
+                blank_correction=BlankCorrectionMethod.NONE,
+                regression_model=model,
+            ),
+        )
+
+
+def test_non_monotonic_polynomial_fit_is_rejected() -> None:
+    with pytest.raises(CalibrationError) as captured:
+        calibrate_and_quantify(
+            [standard(f"s{x}", x, (x - 2) ** 2) for x in range(5)],
+            CalibrationSettings(
+                blank_correction=BlankCorrectionMethod.NONE,
+                regression_model=RegressionModel.QUADRATIC,
+            ),
+        )
+    assert captured.value.warnings[0].code == "non_monotonic_fitted_curve"
+
+
+def test_polynomial_unknown_is_not_silently_extrapolated() -> None:
+    samples = [standard(f"s{x}", x, x**2) for x in range(5)]
+    samples.append(CalibrationInput("u", SampleType.UNKNOWN, 25))
+    result = calibrate_and_quantify(
+        samples,
+        CalibrationSettings(
+            blank_correction=BlankCorrectionMethod.NONE,
+            regression_model=RegressionModel.QUADRATIC,
+        ),
+    )
+    unknown = next(sample for sample in result.samples if sample.sample_id == "u")
+    assert unknown.measured_concentration is None
+    assert any(
+        warning.code == "extrapolated_unknown" and warning.sample_id == "u"
+        for warning in result.warnings
+    )

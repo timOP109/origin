@@ -64,6 +64,25 @@ fixture is unavailable.
 direct-infusion-quant
 ```
 
+## Controlled analysis entries
+
+The desktop tables use controlled selectors for sample role (`Unknown (sample)`,
+`Standard`, `Blank`, or `QC`), target tolerance (`Da` or `ppm`), and optional
+positive charge annotation (`Not specified` or `+1` through `+15`). New projects
+offer `pg/mL`, `ng/mL`, `µg/mL`, `mg/mL`, `pM`, `nM`, `µM`, `mM`, and `M` as
+concentration units. A unit found in an older saved project is displayed as a
+saved-project value so the project remains reviewable. Units are recorded as
+entered and are never converted automatically.
+
+Linear calibration with an intercept and no weighting remains the default.
+Quadratic, cubic, and quartic polynomial models are explicit advanced choices;
+the application does not select a model from R-squared. Nonlinear orders require
+at least degree plus three distinct standard levels, must be monotonic over the
+calibrated range, and report an inverse concentration only when a unique real root
+lies inside that range. Force-through-zero is restricted to linear calibration.
+These controls support reproducibility and scientific review and do not imply
+regulatory compliance.
+
 Alternatively:
 
 ```powershell

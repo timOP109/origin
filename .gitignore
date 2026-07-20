@@ -1,0 +1,3 @@
+# Repository-local environment and generated review artifacts
+/.venv/
+/outputs/

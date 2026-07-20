@@ -15,6 +15,7 @@ from direct_infusion_quant.models import (
     MzMLBackend,
     ProcessingSettings,
     QuantifierMode,
+    RegressionModel,
     SampleRecord,
     SampleType,
     SourceFileProvenance,
@@ -97,6 +98,7 @@ def example_project() -> AnalysisProject:
         ),
         calibration=CalibrationSettings(
             blank_correction=BlankCorrectionMethod.NONE,
+            regression_model=RegressionModel.LINEAR,
             weighting=WeightingMode.INVERSE_X,
             force_through_zero=True,
             large_residual_absolute=100.0,
@@ -136,6 +138,19 @@ def test_project_round_trip_preserves_all_settings(tmp_path: Path) -> None:
     assert document["schema_version"] == CURRENT_SCHEMA_VERSION
     assert document["saved_at_utc"].endswith("+00:00")
     assert len(document["project_sha256"]) == 64
+
+
+def test_project_round_trip_preserves_explicit_polynomial_model(
+    tmp_path: Path,
+) -> None:
+    project = example_project()
+    project.calibration = CalibrationSettings(
+        blank_correction=BlankCorrectionMethod.NONE,
+        regression_model=RegressionModel.CUBIC,
+    )
+    path = tmp_path / "cubic.diq.json"
+    save_project(project, path)
+    assert load_project(path).calibration.regression_model is RegressionModel.CUBIC
 
 
 def test_modified_settings_fail_integrity_check(tmp_path: Path) -> None:

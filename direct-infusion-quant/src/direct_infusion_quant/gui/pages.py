@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from uuid import UUID
 
+import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -39,6 +41,7 @@ from direct_infusion_quant.models import (
     MzMLBackend,
     ProcessingSettings,
     QuantifierMode,
+    RegressionModel,
     SampleRecord,
     SampleType,
     SourceFileProvenance,
@@ -48,6 +51,25 @@ from direct_infusion_quant.models import (
     WeightingMode,
 )
 from direct_infusion_quant.processing import FileProcessingResult
+
+CONCENTRATION_UNITS = (
+    "pg/mL",
+    "ng/mL",
+    "µg/mL",
+    "mg/mL",
+    "pM",
+    "nM",
+    "µM",
+    "mM",
+    "M",
+)
+
+SAMPLE_TYPE_LABELS = {
+    SampleType.UNKNOWN: "Unknown (sample)",
+    SampleType.STANDARD: "Standard",
+    SampleType.BLANK: "Blank",
+    SampleType.QC: "QC",
+}
 
 
 def _item(text: object = "", *, editable: bool = True) -> QTableWidgetItem:
@@ -71,6 +93,7 @@ class FilesPage(QWidget):
     add_requested = Signal()
     inspect_requested = Signal()
     backend_changed = Signal(object)
+    calibration_inputs_changed = Signal()
 
     HEADERS = [
         "Included",
@@ -90,9 +113,11 @@ class FilesPage(QWidget):
         super().__init__()
         self.table = QTableWidget(0, len(self.HEADERS))
         self.table.setHorizontalHeaderLabels(self.HEADERS)
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        header = self.table.horizontalHeader()
+        header.setMinimumSectionSize(70)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        for column in (1, 2, 9):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         add_button = QPushButton("Add mzML files…")
         add_button.clicked.connect(self.add_requested)
@@ -145,9 +170,11 @@ class FilesPage(QWidget):
             file_item.setToolTip(str(resolved))
             self.table.setItem(row, 1, file_item)
             self.table.setItem(row, 2, _item(resolved.stem))
-            self.table.setItem(row, 3, _item(SampleType.UNKNOWN.value))
+            self.table.setItem(row, 3, _item(editable=False))
+            self._set_sample_type(row, SampleType.UNKNOWN)
             self.table.setItem(row, 4, _item())
-            self.table.setItem(row, 5, _item())
+            self.table.setItem(row, 5, _item(editable=False))
+            self._set_concentration_unit(row, None)
             self.table.setItem(row, 6, _item("1"))
             self.table.setItem(row, 7, _item())
             self.table.setItem(row, 8, _item())
@@ -160,6 +187,8 @@ class FilesPage(QWidget):
         )
         for row in rows:
             self.table.removeRow(row)
+        if rows:
+            self.calibration_inputs_changed.emit()
 
     def set_metadata(self, path: Path, text: str, warning: bool = False) -> None:
         for row in range(self.table.rowCount()):
@@ -222,14 +251,14 @@ class FilesPage(QWidget):
                     **identity,
                     path=Path(file_item.data(Qt.ItemDataRole.UserRole)),
                     sample_name=self.table.item(row, 2).text().strip(),
-                    sample_type=SampleType(self.table.item(row, 3).text().strip()),
+                    sample_type=SampleType(self.table.cellWidget(row, 3).currentData()),
                     included=(
                         self.table.item(row, 0).checkState() == Qt.CheckState.Checked
                     ),
                     concentration=float(concentration_text)
                     if concentration_text
                     else None,
-                    concentration_unit=self.table.item(row, 5).text().strip() or None,
+                    concentration_unit=self.table.cellWidget(row, 5).currentData(),
                     dilution_factor=float(self.table.item(row, 6).text()),
                     replicate_group=self.table.item(row, 7).text().strip() or None,
                     time_start_seconds=(
@@ -253,11 +282,11 @@ class FilesPage(QWidget):
             file_item.setData(Qt.ItemDataRole.UserRole + 1, str(sample.id))
             file_item.setData(self.SOURCE_PROVENANCE_ROLE, sample.source_provenance)
             self.table.item(row, 2).setText(sample.sample_name)
-            self.table.item(row, 3).setText(sample.sample_type.value)
+            self._set_sample_type(row, sample.sample_type)
             self.table.item(row, 4).setText(
                 "" if sample.concentration is None else str(sample.concentration)
             )
-            self.table.item(row, 5).setText(sample.concentration_unit or "")
+            self._set_concentration_unit(row, sample.concentration_unit)
             self.table.item(row, 6).setText(str(sample.dilution_factor))
             self.table.item(row, 7).setText(sample.replicate_group or "")
             self.table.item(row, 8).setText(
@@ -314,6 +343,54 @@ class FilesPage(QWidget):
 
         self.backend.setCurrentIndex(self.backend.findData(backend))
 
+    def standard_level_count(self) -> int:
+        """Return the number of valid, distinct displayed standard levels."""
+
+        levels: set[float] = set()
+        for row in range(self.table.rowCount()):
+            included_item = self.table.item(row, 0)
+            type_widget = self.table.cellWidget(row, 3)
+            concentration_item = self.table.item(row, 4)
+            if (
+                included_item is None
+                or included_item.checkState() != Qt.CheckState.Checked
+                or type_widget is None
+                or concentration_item is None
+            ):
+                continue
+            sample_type = SampleType(type_widget.currentData())
+            text = concentration_item.text().strip()
+            if sample_type is SampleType.STANDARD and text:
+                try:
+                    levels.add(float(text))
+                except ValueError:
+                    continue
+        return len(levels)
+
+    def _set_sample_type(self, row: int, sample_type: SampleType) -> None:
+        combo = QComboBox()
+        for value, label in SAMPLE_TYPE_LABELS.items():
+            combo.addItem(label, value)
+        combo.setCurrentIndex(combo.findData(sample_type))
+        combo.currentIndexChanged.connect(self.calibration_inputs_changed)
+        combo.setToolTip("Select the sample's role in calibration and quantification.")
+        self.table.setCellWidget(row, 3, combo)
+
+    def _set_concentration_unit(self, row: int, unit: str | None) -> None:
+        combo = QComboBox()
+        combo.addItem("Not set", None)
+        for value in CONCENTRATION_UNITS:
+            combo.addItem(value, value)
+        if unit is not None and combo.findData(unit) < 0:
+            combo.addItem(f"{unit} (saved project)", unit)
+        combo.setCurrentIndex(combo.findData(unit))
+        combo.currentIndexChanged.connect(self.calibration_inputs_changed)
+        combo.setToolTip(
+            "Select one concentration unit and use it unchanged for all standards. "
+            "The application does not automatically convert units."
+        )
+        self.table.setCellWidget(row, 5, combo)
+
 
 class TargetsPage(QWidget):
     """Analyte definition and explicit quantifier selection."""
@@ -327,6 +404,7 @@ class TargetsPage(QWidget):
         "Unit",
         "Charge",
     ]
+    definition_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -342,9 +420,10 @@ class TargetsPage(QWidget):
         form.addRow("Notes", self.notes)
         self.table = QTableWidget(0, len(self.HEADERS))
         self.table.setHorizontalHeaderLabels(self.HEADERS)
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        header = self.table.horizontalHeader()
+        header.setMinimumSectionSize(70)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.quantifier_mode = QComboBox()
         self.quantifier_mode.addItem(
             "Choose one quantifier window", QuantifierMode.SINGLE
@@ -354,7 +433,7 @@ class TargetsPage(QWidget):
             "Windows are never combined unless 'Sum selected windows' is chosen."
         )
         add_button = QPushButton("Add window")
-        add_button.clicked.connect(self.add_window)
+        add_button.clicked.connect(lambda _checked=False: self.add_window())
         remove_button = QPushButton("Remove selected")
         remove_button.clicked.connect(self.remove_selected)
         row = QHBoxLayout()
@@ -368,18 +447,20 @@ class TargetsPage(QWidget):
         layout.addLayout(form)
         layout.addLayout(row)
         layout.addWidget(self.table)
+        self.table.itemChanged.connect(self._window_item_changed)
+        self.quantifier_mode.currentIndexChanged.connect(self._quantifier_mode_changed)
 
     def add_window(self, window: ExtractionWindow | None = None) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
-        enabled = _item()
+        enabled = _item(editable=False)
         enabled.setFlags(enabled.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         enabled.setCheckState(
             Qt.CheckState.Checked
             if window is None or window.enabled
             else Qt.CheckState.Unchecked
         )
-        selected = _item()
+        selected = _item(editable=False)
         selected.setFlags(selected.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         selected.setCheckState(Qt.CheckState.Unchecked)
         self.table.setItem(row, 0, enabled)
@@ -393,9 +474,31 @@ class TargetsPage(QWidget):
         self.table.setItem(
             row,
             5,
-            _item(window.tolerance_unit.value if window else ToleranceUnit.DA.value),
+            _item(editable=False),
         )
-        self.table.setItem(row, 6, _item(window.charge if window else ""))
+        unit = QComboBox()
+        for tolerance_unit in ToleranceUnit:
+            unit.addItem(tolerance_unit.value, tolerance_unit)
+        unit.setCurrentIndex(
+            unit.findData(window.tolerance_unit if window else ToleranceUnit.DA)
+        )
+        unit.currentIndexChanged.connect(self.definition_changed)
+        unit.setToolTip("Tolerance half-width expressed in Da or ppm.")
+        self.table.setCellWidget(row, 5, unit)
+        self.table.setItem(row, 6, _item(editable=False))
+        charge = QComboBox()
+        charge.addItem("Not specified", None)
+        for value in range(1, 16):
+            charge.addItem(f"+{value}", value)
+        charge.setCurrentIndex(charge.findData(window.charge if window else None))
+        charge.currentIndexChanged.connect(self.definition_changed)
+        charge.setToolTip(
+            "Optional positive-ion charge-state annotation (+1 to +15). It does "
+            "not change the numerical m/z extraction window."
+        )
+        self.table.setCellWidget(row, 6, charge)
+        self._set_quantifier_enabled(row, enabled.checkState() == Qt.CheckState.Checked)
+        self.definition_changed.emit()
 
     def remove_selected(self) -> None:
         rows = sorted(
@@ -403,6 +506,8 @@ class TargetsPage(QWidget):
         )
         for row in rows:
             self.table.removeRow(row)
+        if rows:
+            self.definition_changed.emit()
 
     def analyte(self, existing_id: UUID | None = None) -> AnalyteTarget:
         windows: list[ExtractionWindow] = []
@@ -432,15 +537,14 @@ class TargetsPage(QWidget):
             ) = items
             try:
                 window_id = label_item.data(Qt.ItemDataRole.UserRole)
-                charge = charge_item.text().strip()
                 identity = {"id": UUID(window_id)} if window_id else {}
                 window = ExtractionWindow(
                     **identity,
                     name=label_item.text().strip(),
                     target_mz=float(mz_item.text()),
                     tolerance=float(tolerance_item.text()),
-                    tolerance_unit=ToleranceUnit(unit_item.text().strip()),
-                    charge=int(charge) if charge else None,
+                    tolerance_unit=self.table.cellWidget(row, 5).currentData(),
+                    charge=self.table.cellWidget(row, 6).currentData(),
                     enabled=(enabled_item.checkState() == Qt.CheckState.Checked),
                 )
             except (TypeError, ValueError) as error:
@@ -482,6 +586,50 @@ class TargetsPage(QWidget):
                 self.table.item(self.table.rowCount() - 1, 1).setCheckState(
                     Qt.CheckState.Checked
                 )
+
+    def _window_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 0:
+            enabled = item.checkState() == Qt.CheckState.Checked
+            self._set_quantifier_enabled(item.row(), enabled)
+            if not enabled:
+                quantifier = self.table.item(item.row(), 1)
+                quantifier.setCheckState(Qt.CheckState.Unchecked)
+        elif (
+            item.column() == 1
+            and item.checkState() == Qt.CheckState.Checked
+            and QuantifierMode(self.quantifier_mode.currentData())
+            is QuantifierMode.SINGLE
+        ):
+            self.table.blockSignals(True)
+            try:
+                for row in range(self.table.rowCount()):
+                    if row != item.row():
+                        self.table.item(row, 1).setCheckState(Qt.CheckState.Unchecked)
+            finally:
+                self.table.blockSignals(False)
+        self.definition_changed.emit()
+
+    def _quantifier_mode_changed(self) -> None:
+        if QuantifierMode(self.quantifier_mode.currentData()) is QuantifierMode.SINGLE:
+            checked = [
+                row
+                for row in range(self.table.rowCount())
+                if self.table.item(row, 1).checkState() == Qt.CheckState.Checked
+            ]
+            for row in checked[1:]:
+                self.table.item(row, 1).setCheckState(Qt.CheckState.Unchecked)
+        self.definition_changed.emit()
+
+    def _set_quantifier_enabled(self, row: int, enabled: bool) -> None:
+        item = self.table.item(row, 1)
+        if item is None:
+            return
+        flags = item.flags()
+        item.setFlags(
+            flags | Qt.ItemFlag.ItemIsEnabled
+            if enabled
+            else flags & ~Qt.ItemFlag.ItemIsEnabled
+        )
 
 
 class IntervalCanvas(PlotCanvas):
@@ -535,6 +683,10 @@ class IntervalCanvas(PlotCanvas):
 
 class TimePage(QWidget):
     """Fixed-duration acquisition interval and spray-response preview."""
+
+    BASE_PLOT_HEIGHT = 360
+    STABILITY_PANEL_HEIGHT = 145
+    STABILITY_PLOT_PADDING = 80
 
     process_requested = Signal()
     cancel_requested = Signal()
@@ -686,12 +838,19 @@ class TimePage(QWidget):
         self.canvas.interval_changed.connect(self._from_plot)
         self.start.valueChanged.connect(self._to_plot)
         self.end.valueChanged.connect(self._to_plot)
+        self.plot_scroll = QScrollArea()
+        self.plot_scroll.setWidgetResizable(True)
+        self.plot_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.plot_scroll.setMinimumHeight(300)
+        self.plot_scroll.setWidget(self.canvas)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Time Window and Stability"))
         layout.addLayout(form)
         layout.addLayout(buttons)
         layout.addWidget(self.intervals_confirmed)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.plot_scroll, 1)
         watched = [
             self.ms_level,
             self.start,
@@ -866,6 +1025,7 @@ class TimePage(QWidget):
         names: dict[str, str],
         project: AnalysisProject,
     ) -> None:
+        self.canvas.setMinimumHeight(self.BASE_PLOT_HEIGHT)
         self.canvas.figure.clear()
         self.canvas.axes = self.canvas.figure.add_subplot(111)
         for sample_id, result in results.items():
@@ -881,6 +1041,7 @@ class TimePage(QWidget):
         if results:
             self.canvas.axes.legend(fontsize="small")
         self.canvas.set_interval(self.start.value(), self.end.value())
+        self.canvas.figure.tight_layout()
 
     def plot_stability_assessment(
         self, assessments: dict, names: dict[str, str]
@@ -889,6 +1050,12 @@ class TimePage(QWidget):
 
         self.canvas.figure.clear()
         items = list(assessments.items())
+        self.canvas.setMinimumHeight(
+            max(
+                self.BASE_PLOT_HEIGHT,
+                len(items) * self.STABILITY_PANEL_HEIGHT + self.STABILITY_PLOT_PADDING,
+            )
+        )
         axes = []
         for index, (sample_id, assessment) in enumerate(items, start=1):
             axis = self.canvas.figure.add_subplot(
@@ -905,16 +1072,33 @@ class TimePage(QWidget):
                     candidate.start_seconds,
                     candidate.end_seconds,
                     alpha=max(0.08, 0.25 - 0.05 * (rank - 1)),
-                    label=f"candidate {rank}",
+                    label=f"Candidate {rank}",
                 )
-            axis.set_ylabel(names.get(sample_id, sample_id))
-            if index == 1 and assessment.candidates:
-                axis.legend(fontsize="x-small", ncol=len(assessment.candidates))
+            axis.set_title(
+                names.get(sample_id, sample_id), loc="left", fontsize=9, pad=3
+            )
+            axis.tick_params(axis="both", labelsize=8)
+            axis.ticklabel_format(
+                axis="y", style="sci", scilimits=(-3, 4), useMathText=True
+            )
+            axis.grid(axis="y", alpha=0.2, linewidth=0.5)
+            if index < len(items):
+                axis.tick_params(axis="x", labelbottom=False)
         if axes:
             axes[-1].set_xlabel("Elapsed acquisition time (s)")
             self.canvas.axes = axes[0]
-        self.canvas.figure.supylabel("Selected stability-trace response")
-        self.canvas.figure.tight_layout()
+            handles, labels = axes[0].get_legend_handles_labels()
+            if handles:
+                self.canvas.figure.legend(
+                    handles,
+                    labels,
+                    loc="upper center",
+                    ncol=len(handles),
+                    fontsize="x-small",
+                    frameon=False,
+                )
+        self.canvas.figure.supylabel("Stability-trace response", x=0.01, fontsize=9)
+        self.canvas.figure.tight_layout(rect=(0.035, 0.02, 1.0, 0.95), h_pad=1.0)
         self.canvas.draw_idle()
 
     def _from_plot(self, start: float, end: float) -> None:
@@ -1023,6 +1207,7 @@ class CalibrationPage(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self._standard_level_count = 0
         self.response_method = QComboBox()
         for method in SummaryMethod:
             self.response_method.addItem(method.value.replace("_", " ").title(), method)
@@ -1032,6 +1217,17 @@ class CalibrationPage(QWidget):
         self.weighting = QComboBox()
         for method in WeightingMode:
             self.weighting.addItem(method.value, method)
+        self.regression = QComboBox()
+        self.regression.addItem("Linear", RegressionModel.LINEAR)
+        self.regression.addItem("Quadratic", RegressionModel.QUADRATIC)
+        self.regression.addItem("Cubic (advanced)", RegressionModel.CUBIC)
+        self.regression.addItem("Quartic (advanced)", RegressionModel.QUARTIC)
+        self.regression.setToolTip(
+            "Linear is the default. Higher orders require explicit method "
+            "justification and sufficient distinct standard levels. Models are "
+            "never selected automatically from R²."
+        )
+        self.regression.currentIndexChanged.connect(self._update_model_controls)
         self.force_zero = QCheckBox("Force calibration through zero")
         self.force_zero.setToolTip(
             "Off by default; enable only when explicitly required."
@@ -1050,7 +1246,7 @@ class CalibrationPage(QWidget):
         form = QFormLayout()
         form.addRow("Response statistic", self.response_method)
         form.addRow("Blank method", self.blank_method)
-        form.addRow("Regression", QLabel("Linear"))
+        form.addRow("Regression", self.regression)
         form.addRow("Weighting", self.weighting)
         form.addRow("Intercept", self.force_zero)
         form.addRow(self.residual_limit_enabled, self.residual_limit)
@@ -1087,10 +1283,12 @@ class CalibrationPage(QWidget):
         layout.addWidget(self.summary)
         layout.addWidget(plots)
         layout.addWidget(tabs)
+        self._update_model_controls()
 
     def settings(self) -> CalibrationSettings:
         return CalibrationSettings(
             blank_correction=self.blank_method.currentData(),
+            regression_model=RegressionModel(self.regression.currentData()),
             weighting=self.weighting.currentData(),
             force_through_zero=self.force_zero.isChecked(),
             large_residual_absolute=(
@@ -1106,16 +1304,43 @@ class CalibrationPage(QWidget):
         )
 
     def set_run_availability(self, has_results: bool, confirmed: bool) -> None:
-        self.run_button.setEnabled(has_results and confirmed)
+        model = RegressionModel(self.regression.currentData())
+        required_levels = model.degree + 3 if model.degree > 1 else 0
+        levels_available = self._standard_level_count >= required_levels
+        self.run_button.setEnabled(has_results and confirmed and levels_available)
         if not has_results:
             reason = "Process files before fitting calibration."
         elif not confirmed:
             reason = (
                 "Review and explicitly confirm every included sample interval first."
             )
+        elif not levels_available:
+            reason = (
+                f"{model.value.title()} calibration requires at least "
+                f"{required_levels} distinct standard levels; "
+                f"{self._standard_level_count} are currently configured."
+            )
         else:
             reason = "Fit calibration using the confirmed fixed-duration intervals."
         self.run_button.setToolTip(reason)
+
+    def set_standard_level_count(self, count: int) -> None:
+        """Disable advanced orders that lack enough distinct standard levels."""
+
+        self._standard_level_count = count
+        model = self.regression.model()
+        for index in range(self.regression.count()):
+            regression = RegressionModel(self.regression.itemData(index))
+            required = regression.degree + 3 if regression.degree > 1 else 0
+            available = count >= required
+            item = model.item(index)
+            if item is not None:
+                item.setEnabled(available)
+                item.setToolTip(
+                    ""
+                    if available
+                    else f"Requires at least {required} distinct standard levels."
+                )
 
     def load_settings(
         self, calibration: CalibrationSettings, processing: ProcessingSettings
@@ -1125,6 +1350,9 @@ class CalibrationPage(QWidget):
         )
         self.blank_method.setCurrentIndex(
             self.blank_method.findData(calibration.blank_correction)
+        )
+        self.regression.setCurrentIndex(
+            self.regression.findData(calibration.regression_model)
         )
         self.weighting.setCurrentIndex(self.weighting.findData(calibration.weighting))
         self.force_zero.setChecked(calibration.force_through_zero)
@@ -1138,12 +1366,18 @@ class CalibrationPage(QWidget):
         )
         if calibration.upper_flattening_slope_ratio is not None:
             self.flattening_limit.setValue(calibration.upper_flattening_slope_ratio)
+        self._update_model_controls()
 
     def show_result(self, result: CalibrationResult, project: AnalysisProject) -> None:
         sample_by_id = {str(sample.id): sample for sample in project.samples}
+        coefficient_text = ", ".join(
+            f"c{power}={value:.6g}"
+            for power, value in enumerate(result.polynomial_coefficients)
+        )
         self.summary.setText(
-            f"Slope {result.slope:.6g}; intercept {result.intercept:.6g}; "
+            f"{result.regression_model.value.title()}; {coefficient_text}; "
             f"R² {_format_optional(result.r_squared)}; RMSE {result.rmse:.6g}; "
+            f"residual df {result.residual_degrees_of_freedom}; "
             f"warnings {len(result.warnings)}"
         )
         standards = [
@@ -1157,10 +1391,8 @@ class CalibrationPage(QWidget):
         y = [sample.blank_corrected_response for sample in standards]
         axes.scatter(x, y, label="Standards")
         if x:
-            limits = [min(x), max(x)]
-            axes.plot(
-                limits, [result.intercept + result.slope * value for value in limits]
-            )
+            curve_x = np.linspace(min(x), max(x), 300)
+            axes.plot(curve_x, result.predict_response(curve_x))
         axes.set_xlabel(f"Concentration ({result.concentration_unit})")
         axes.set_ylabel("Response")
         self.calibration_canvas.draw_idle()
@@ -1199,6 +1431,19 @@ class CalibrationPage(QWidget):
                 ]
                 for column, value in enumerate(values):
                     self.unknowns.setItem(row, column, _item(value, editable=False))
+
+    def _update_model_controls(self) -> None:
+        linear = (
+            RegressionModel(self.regression.currentData()) is RegressionModel.LINEAR
+        )
+        if not linear:
+            self.force_zero.setChecked(False)
+        self.force_zero.setEnabled(linear)
+        self.force_zero.setToolTip(
+            "Off by default; enable only when explicitly required."
+            if linear
+            else "Force through zero is restricted to linear calibration."
+        )
 
 
 class ExportPage(QWidget):

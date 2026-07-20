@@ -5,22 +5,26 @@ from pathlib import Path
 
 import numpy as np
 import openpyxl
+import pytest
 from matplotlib.figure import Figure
 
+from direct_infusion_quant.calibration import CalibrationInput, calibrate_and_quantify
 from direct_infusion_quant.export import (
     export_csv_tables,
     export_excel_workbook,
     export_png_plots,
 )
-from direct_infusion_quant.export.tables import CSV_NAMES, SHEET_NAMES
+from direct_infusion_quant.export.tables import CSV_NAMES, SHEET_NAMES, result_tables
 from direct_infusion_quant.io.base import SpectrumRecord
 from direct_infusion_quant.models import (
     AnalysisProject,
     AnalyteTarget,
+    CalibrationSettings,
     ExtractionWindow,
     MzMLBackend,
     ProcessingSettings,
     QuantifierMode,
+    RegressionModel,
     SampleRecord,
     SampleType,
     SourceFileProvenance,
@@ -101,6 +105,7 @@ def project_and_results(tmp_path: Path):
         analytes=[analyte],
         active_analyte_id=analyte.id,
         processing=settings,
+        calibration=CalibrationSettings(regression_model=RegressionModel.QUADRATIC),
         last_processing_timestamp_utc=datetime(2026, 7, 18, 12, tzinfo=UTC),
     )
     spectra = [
@@ -140,6 +145,7 @@ def test_csv_and_excel_contain_all_reproducibility_tables(tmp_path: Path) -> Non
     assert "mzml_reader_backend" in settings_text
     assert "pyopenms" in settings_text
     assert "pooled_median" in settings_text
+    assert "quadratic" in settings_text
     assert "stability_trace_mode" in settings_text
     assessment_text = (tmp_path / "csv" / "stability_assessment.csv").read_text(
         encoding="utf-8"
@@ -170,3 +176,44 @@ def test_png_plot_export(tmp_path: Path) -> None:
     paths = export_png_plots(tmp_path, {"spray-response": figure})
     assert paths == [tmp_path.resolve() / "spray-response.png"]
     assert paths[0].read_bytes().startswith(b"\x89PNG")
+
+
+def test_polynomial_coefficients_are_exported() -> None:
+    samples = [
+        SampleRecord(
+            path=Path(f"s{x}.mzML"),
+            sample_name=f"s{x}",
+            sample_type=SampleType.STANDARD,
+            concentration=float(x),
+            concentration_unit="mg/mL",
+        )
+        for x in range(5)
+    ]
+    settings = CalibrationSettings(
+        blank_correction="none", regression_model=RegressionModel.QUADRATIC
+    )
+    calibration = calibrate_and_quantify(
+        [
+            CalibrationInput(
+                sample_id=str(sample.id),
+                sample_type=sample.sample_type,
+                concentration=sample.concentration,
+                concentration_unit=sample.concentration_unit,
+                file_response=1
+                + 2 * sample.concentration
+                + 3 * sample.concentration**2,
+            )
+            for sample in samples
+        ],
+        settings,
+    )
+    project = AnalysisProject(
+        name="polynomial export", samples=samples, calibration=settings
+    )
+    tables = result_tables(project, {}, calibration)
+    statistics = tables["Calibration Statistics"][0]
+    assert statistics["regression_model"] == "quadratic"
+    assert statistics["polynomial_order"] == 2
+    assert statistics["coefficient_c0"] == pytest.approx(1)
+    assert statistics["coefficient_c1"] == pytest.approx(2)
+    assert statistics["coefficient_c2"] == pytest.approx(3)

@@ -193,7 +193,9 @@ class MainWindow(QMainWindow):
         self.files_page.inspect_requested.connect(self.inspect_metadata)
         self.files_page.backend_changed.connect(self._backend_changed)
         self.files_page.table.itemChanged.connect(self._sample_table_changed)
+        self.files_page.calibration_inputs_changed.connect(self._update_availability)
         self.targets_page.table.itemChanged.connect(self._target_changed)
+        self.targets_page.definition_changed.connect(self._target_changed)
         self.targets_page.name.textChanged.connect(self._target_changed)
         self.time_page.process_requested.connect(self.start_processing)
         self.time_page.recommendation_requested.connect(self.assess_stable_periods)
@@ -226,6 +228,8 @@ class MainWindow(QMainWindow):
     def _sample_table_changed(self, item) -> None:
         if not self._loading_pages and item.column() in {0, 8}:
             self.time_page.intervals_confirmed.setChecked(False)
+        if not self._loading_pages and item.column() in {0, 3, 4, 5}:
+            self._update_availability()
 
     def _target_changed(self, *_args) -> None:
         if not self._loading_pages:
@@ -875,6 +879,9 @@ class MainWindow(QMainWindow):
         self._update_hash_action()
 
     def _update_availability(self) -> None:
+        self.calibration_page.set_standard_level_count(
+            self.files_page.standard_level_count()
+        )
         self.export_page.set_availability(
             bool(self.processing_results), self.calibration_result is not None
         )
